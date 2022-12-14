@@ -1,0 +1,4 @@
+name = "swm"
+uuid = "79f51499-dc34-4546-ba99-fcac4ddc1166"
+authors = ["Eugene Koshel <eugenefade@gmail.com>"]
+version = "0.1.0"
