@@ -1,2 +1,6 @@
 .vscode
-src/.ipynb_checkpoints
+**/.ipynb_checkpoints
+src/samples
+*.ipynb
+*.bson
+src/.virtual_documents
