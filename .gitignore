@@ -1,6 +1,12 @@
 .vscode
 **/.ipynb_checkpoints
 src/samples
-*.ipynb
-*.bson
+**.ipynb
+**.bson
 src/.virtual_documents
+Manifest.toml
+**.bkp
+**.dtmp
+articles
+**.zip
+**.doc

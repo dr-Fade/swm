@@ -2,6 +2,8 @@ using WORLD
 include("dio.jl")
 include("cheaptrick.jl")
 
+const MFCC_SIZE = 20
+
 function sound_to_micro_frames(sound::Vector{Float32}, sample_rate::Int32; f0_floor = 60.0f0, f0_ceil = 600.0f0, freqs_cutoff::Float32=4000.0f0, hop = 1.0)
 
     spectrogram_size = nothing
@@ -30,9 +32,7 @@ function sound_to_micro_frames(sound::Vector{Float32}, sample_rate::Int32; f0_fl
 
             # spectral part
             spectrogram = cheaptrick_jl(ct, f0[1], frame)
-            # spectrogram = cheaptrick(frame, sample_rate, [0.0], [f0[1]])
-            previous_envelope = spectrogram
-            mc = sp2mc(spectrogram, 20, 0.41)
+            mc = sp2mc(spectrogram, MFCC_SIZE, 0.41)
 
             # aperiodicity
             aperiodicity = d4c(frame, sample_rate, [0.0], [f0[1]])
@@ -42,7 +42,7 @@ function sound_to_micro_frames(sound::Vector{Float32}, sample_rate::Int32; f0_fl
             loudness = rms(frame)
 
             # flattened vector of features and target
-            features = [sample_rate; loudness; f0[1]; mc; coded_aperiodicity][:,1] |> Vector{Float32}
+            features = [loudness; f0[1]; mc; coded_aperiodicity][:,1] |> Vector{Float32}
             target = reshape(spectrogram, length(spectrogram)) |> Vector{Float32}
 
             # sizes info

@@ -1,6 +1,6 @@
-using Lux, Random, LinearAlgebra
+using Lux, Random, LinearAlgebra, CUDA
 
-struct AntisymmetricRNN{A, B, W, S} <: Lux.AbstractExplicitLayer
+struct AntisymmetricRNN{A, B, W, S} <: Lux.AbstractRecurrentCell{true, false}
     n::Int
     activation::A
     init_bias::B
@@ -22,6 +22,8 @@ Lux.initialparameters(rng::AbstractRNG, f::AntisymmetricRNN) = (
     γ = abs.(rand(rng)),
     ε = abs.(rand(rng))
 )
+
+Lux.parameterlength(f::AntisymmetricRNN) = 3*f.n^2 + 2*f.n + 2
 
 Lux.initialstates(rng::AbstractRNG, f::AntisymmetricRNN) = (
     rng = Lux.replicate(rng),
