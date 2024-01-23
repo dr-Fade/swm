@@ -2,21 +2,7 @@ include("hnode.jl")
 include("training_utils.jl")
 
 
-function loss(model, ps, st, data)
-    xs, ys = data
-    pred_ys, st = model(xs, ps, st)
-    loss = sum(abs2, ys .- pred_ys)
-    return loss, st, pred_ys
-end
-
-function chunk_data(data::Matrix, chunk_size::Int)
-    return [
-        data[i:i+chunk_size-1]
-        for i ∈ 1:size(data)[1]-chunk_size
-    ]    
-end
-
-function time_series_to_latent(encoder, ps, st, series::Matrix, chunk_size::Int)
+function time_series_to_latent(encoder::Lux.AbstractExplicitLayer, ps, st, series::Matrix, chunk_size::Int)
     return vcat([
         begin
             latent, st_encoder = encoder(chunk, ps, st)
@@ -37,42 +23,27 @@ function latent_to_time_series(decoder, ps, st, latent_points::Matrix)
     ]'...)
 end
 
-function train_encoders(hnode::hNODE, ps, st::NamedTuple, series; batchsize = 1, epochs = 1, optimiser = Optimisers.Adam())
+function train_encoders(hnode::hNODE, ps, st::NamedTuple, input_n, series; batchsize = 1, chunk_step = 1, epochs = 1, optimiser = Optimisers.Adam())
     # model
-    model = Lux.Chain(
-        hnode.encoder,
-        hnode.decoder;
+    model = Lux.Chain(;
+        encoder = hnode.encoder,
+        decoder = hnode.decoder,
         disable_optimizations = true
     )
-    model_ps = (layer_1 = ps.encoder, layer_2 = ps.decoder)
-    model_st = (layer_1 = st.encoder, layer_2 = st.decoder)
+    model_ps = (encoder = ps.encoder, decoder = ps.decoder)
+    model_st = (encoder = st.encoder, decoder = st.decoder)
 
     # data
-    xs = vcat(chunk_data(series, hnode.in_n)'...)'
+    xs = hcat(chunk_data(series, input_n; step=chunk_step)...)
     ys = xs[end,:]
     train_data = (xs, ys)
     loader = DataLoader(train_data; batchsize = batchsize, shuffle = true)
 
     #training
-    function sum_of_distances_between_predictions(model, ps, st)
-        loss = 0.0
-        for i ∈ 1:size(xs)[2]÷10
-            cur = hnode.encoder(xs[:,i], ps.layer_1, st.layer_1)[1]
-            next = hnode.encoder(xs[:,i+1], ps.layer_1, st.layer_1)[1]
-            loss += sum(abs2, next - cur)
-        end
-        return loss
-    end
+    new_ps, new_st = train(model, loader, loss; ps = model_ps, st = model_st, epochs = epochs, optimiser = optimiser)
 
-    function adjusted_loss(model, ps, st, data)
-        regular_loss, st, _ = loss(model, ps, st, data)
-        distance_loss = 0#.1*sum_of_distances_between_predictions(model, ps, st)
-        return regular_loss + distance_loss, st, ()
-    end
-
-    new_ps, new_st = train(model, loader, adjusted_loss; ps = model_ps, st = model_st, epochs = epochs, optimiser = optimiser)
-
-    return (ps..., encoder = new_ps.layer_1, decoder = new_ps.layer_2), (st..., encoder = new_st.layer_1, decoder = new_st.layer_2)
+    return (ps..., encoder = new_ps.encoder, decoder = new_ps.decoder),
+            (st..., encoder = new_st.encoder, decoder = new_st.decoder)
 end
 
 function train_nested_ode(
@@ -113,7 +84,7 @@ function train_nested_ode(
         return loss, st_hb, ()
     end
 
-    new_ps, new_st = train(node, loader, integrated_loss; ps = hb_ps, st = hb_st, cb = cb, epochs = epochs, optimiser = optimizer)
+    new_ps, new_st = train(node, loader, integrated_loss; ps = hb_ps, st = hb_st, epoch_cb = cb, epochs = epochs, optimiser = optimizer)
 
     return (ps..., hb = new_ps), (st..., hb = new_st)
 end

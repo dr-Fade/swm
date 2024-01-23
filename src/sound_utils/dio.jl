@@ -3,7 +3,7 @@ using LinearAlgebra, SignalAnalysis, DSP
 struct DIO
     f0_ceil::Float64
     f0_floor::Float64
-    sample_rate::Float64
+    sample_rate::Integer
     decimation_rate::Float64
     frame_length::Int
     lowpass_filters::Vector{Vector{Float64}}
@@ -230,7 +230,7 @@ const DC_THRESHOLD = 0.9
 
 # the algorithm is lifted straight from the article:
 # https://www.isca-speech.org/archive/pdfs/interspeech_2016/daido16_interspeech.pdf
-dio(dio::DIO, sample::Vector; previous_estimate::Tuple{Float64, Float64} = (0.0, 0.0)) = sample |>
+(dio::DIO)(sample::Vector; previous_estimate::Tuple{Float64, Float64} = (0.0, 0.0)) = sample |>
     decimate(dio) |>
     remove_dc(DC_THRESHOLD) |>
     attenuate_harmonics(dio) .|>

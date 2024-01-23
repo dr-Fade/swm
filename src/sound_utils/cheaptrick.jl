@@ -16,15 +16,17 @@ struct CheapTrick
     f0_floor::Float64
     sample_rate::Float64
     fft_size::Int
+    max_frame_size::Int
     default_frame_size::Int
     default_window::Vector{Float64}
     default_window_sum::Float64
     padded_sample::Vector{Float64}
     spectrum_zeros_safeguard::Vector{Float64}
     CheapTrick(f0_ceil, f0_floor, sample_rate) = begin
-        frame_size = 3 * (sample_rate÷f0_ceil |> Int)
-        fft_size = nextfastfft(2 ^ ceil(log2(3 * sample_rate / f0_floor + 1)-1) |> Int)
-        window = hanning(frame_size)
+        default_frame_size = 3 * sample_rate ÷ f0_ceil |> Int
+        max_frame_size = 3 * sample_rate ÷ f0_floor |> Int
+        fft_size = nextfastfft(2 ^ ceil(log2(max_frame_size)) |> Int)
+        window = hanning(default_frame_size)
         spectrum_zeros_safeguard = rand(fft_size)
         spectrum_zeros_safeguard ./= min((spectrum_zeros_safeguard ./ eps())...)
         new(
@@ -32,7 +34,8 @@ struct CheapTrick
             f0_floor,
             sample_rate,
             fft_size,
-            frame_size,
+            max_frame_size,
+            default_frame_size,
             window,
             sum(window),
             zeros(2fft_size),
@@ -42,7 +45,7 @@ struct CheapTrick
 end
 
 # The algorithm was lifted directly form the article - https://www.sciencedirect.com/science/article/pii/S0167639314000697#s0015
-cheaptrick_jl(ct::CheapTrick, f0::Float64, sample::Vector{Float64})::Vector{Float64} = begin
+(ct::CheapTrick)(f0::Float64, sample::Vector{Float64})::Vector{Float64} = begin
     # DIO returns 0 if it fails to detect pitch, use ceil f0 as a fallback because higher f0 == wider smoothing windows
     # the frequency can be too low to fit into the sample, so we'll have to force the frame size
     # to not fit.

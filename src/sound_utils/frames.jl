@@ -4,6 +4,27 @@ include("cheaptrick.jl")
 
 const MFCC_SIZE = 20
 
+function get_features(frame::Vector{Float32}, dio::DIO, cheaptrick::CheapTrick, prev_f0_estimate = (0.0, 0.0))
+    frame = frame |> Vector{Float64}
+    # f0
+    f0 = dio(frame; previous_estimate = prev_f0_estimate)
+    # spectral part
+    spectrogram = cheaptrick(f0[1], frame)
+    mc = sp2mc(spectrogram, MFCC_SIZE, 0.41)[2:end]
+    # aperiodicity
+    aperiodicity = d4c(frame, dio.sample_rate, [0.0], [f0[1]])
+    coded_aperiodicity = code_aperiodicity(aperiodicity, dio.sample_rate)
+    # dynamics
+    loudness = rms(frame)
+
+    return loudness, f0, mc, coded_aperiodicity, spectrogram
+end
+
+function get_flat_features(frame, dio, cheaptrick)
+    loudness, f0, mc, coded_aperiodicity, _ = get_features(frame, dio, cheaptrick)
+    return [loudness; f0[1]; mc; coded_aperiodicity][:,1] |> Vector{Float32}
+end
+
 function sound_to_micro_frames(sound::Vector{Float32}, sample_rate::Int32; f0_floor = 60.0f0, f0_ceil = 600.0f0, freqs_cutoff::Float32=4000.0f0, hop = 1.0)
 
     spectrogram_size = nothing
@@ -11,7 +32,7 @@ function sound_to_micro_frames(sound::Vector{Float32}, sample_rate::Int32; f0_fl
     coded_aperiodicity_size = nothing
 
     dio = DIO(f0_ceil, f0_floor, sample_rate; relative_peak_threshold = 0.5, noise_floor = 0.005)
-    ct = CheapTrick(f0_ceil, f0_floor, sample_rate)
+    cheaptrick = CheapTrick(f0_ceil, f0_floor, sample_rate)
 
     # the f0 estimator needs at least 1 / f0_floor samples to work properly so the frame size has to be lowered
     step = (hop * (sample_rate / 1000)) |> round |> Int
@@ -24,26 +45,11 @@ function sound_to_micro_frames(sound::Vector{Float32}, sample_rate::Int32; f0_fl
             else
                 i:-1:i-frame_size
             end
-            frame = sound[frame_range] |> Vector{Float64}
-
-            # f0
-            f0 = dio(dio, frame; previous_estimate = prev_f0_estimate)
-            prev_f0_estimate = f0
-
-            # spectral part
-            spectrogram = cheaptrick_jl(ct, f0[1], frame)
-            mc = sp2mc(spectrogram, MFCC_SIZE, 0.41)
-
-            # aperiodicity
-            aperiodicity = d4c(frame, sample_rate, [0.0], [f0[1]])
-            coded_aperiodicity = code_aperiodicity(aperiodicity, sample_rate)
-
-            # dynamics
-            loudness = rms(frame)
-
-            # flattened vector of features and target
+            loudness, f0, mc, coded_aperiodicity, spectrogram = get_features(sound[frame_range], dio, cheaptrick, prev_f0_estimate)
             features = [loudness; f0[1]; mc; coded_aperiodicity][:,1] |> Vector{Float32}
             target = reshape(spectrogram, length(spectrogram)) |> Vector{Float32}
+
+            prev_f0_estimate = f0
 
             # sizes info
             spectrogram_size = isnothing(spectrogram_size) ? size(spectrogram) : spectrogram_size
