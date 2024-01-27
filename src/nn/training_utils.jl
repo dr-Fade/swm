@@ -1,5 +1,25 @@
 using Optimisers, Zygote, Lux, MLUtils
 
+function time_series_to_latent(encoder, ps, st, series::Vector, chunk_size::Int)
+    return vcat([
+        begin
+            latent, st_encoder = encoder(chunk, ps, st)
+            latent'
+        end
+        for chunk ∈ chunk_data([series;;], chunk_size)
+    ]...)
+end
+
+function latent_to_time_series(decoder, ps, st, latent_points::Matrix)
+    return vcat([
+        begin
+            lp = latent_points[i,:]
+            tsp, st_decoder = decoder(lp, ps, st)
+            tsp
+        end
+        for i ∈ 1:size(latent_points)[1]
+    ]'...)
+end
 
 function loss(model, ps, st, data)
     xs, ys = data
@@ -58,7 +78,7 @@ function train(
         end
 
         if !isnothing(epoch_cb)
-            epoch_cb(loss, stats, epoch, tstate.parameters, tstate.states)
+            epoch_cb(loss_function, epoch, tstate.parameters, tstate.states)
         end
     end
 

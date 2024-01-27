@@ -2,27 +2,6 @@ include("hnode.jl")
 include("training_utils.jl")
 
 
-function time_series_to_latent(encoder::Lux.AbstractExplicitLayer, ps, st, series::Matrix, chunk_size::Int)
-    return vcat([
-        begin
-            latent, st_encoder = encoder(chunk, ps, st)
-            latent'
-        end
-        for chunk ∈ chunk_data(series, chunk_size)
-    ]...)
-end
-
-function latent_to_time_series(decoder, ps, st, latent_points::Matrix)
-    return vcat([
-        begin
-            lp = latent_points[i,:]
-            tsp, st_decoder = decoder(lp, ps, st)
-            tsp
-        end
-        for i ∈ 1:size(latent_points)[1]
-    ]'...)
-end
-
 function train_encoders(hnode::hNODE, ps, st::NamedTuple, input_n, series; batchsize = 1, chunk_step = 1, epochs = 1, optimiser = Optimisers.Adam())
     # model
     model = Lux.Chain(;
