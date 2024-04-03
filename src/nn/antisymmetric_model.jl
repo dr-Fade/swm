@@ -13,7 +13,7 @@ Base.to_indices(x::ComponentArray, i::Tuple{Any}) = i
 
 function (f::AntisymmetricBlock)(u, p, st)
     return (
-        f.σ.((p[:W] - p[:W]' + st.I .* p[:L])*u .+ p[:b]),
+        f.σ.((p[:W] - p[:W]' + Diagonal(p[:L]))*u .+ p[:b]),
         st
     )
 end
@@ -24,4 +24,4 @@ Lux.initialparameters(rng::AbstractRNG, f::AntisymmetricBlock) = (
     b = zeros(f.data_type, f.n)
 )
 
-Lux.initialstates(rng::AbstractRNG, f::AntisymmetricBlock) = (I = I(f.n),)
+Lux.initialstates(rng::AbstractRNG, f::AntisymmetricBlock) = NamedTuple()

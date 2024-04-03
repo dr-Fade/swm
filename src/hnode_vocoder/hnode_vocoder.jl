@@ -1,11 +1,13 @@
 using BSON: @load, @save
+using DynamicalSystems
+
 include("../nn/hnode.jl")
+include("../nn/unitary_block.jl")
 include("../nn/antisymmetric_rnn.jl")
 include("../sound_utils/frames.jl")
 
 const FEATURE_EXTRACTION_SAMPLE_RATE::Int32 = 16000
 const LATENT_DIMS = 10
-const SVD_LATENT_DIMS = 5*LATENT_DIMS
 
 # the scanner is a recurrent network because DIO requires f0 info from the previous frame
 struct FeatureScanner <: Lux.AbstractRecurrentCell{false, false}
@@ -15,6 +17,7 @@ end
 
 const F0_CEIL::Float32 = 600f0
 const F0_FLOOR::Float32 = 60f0
+const ENCODER_INPUT_N::Integer = Integer(2 * FEATURE_EXTRACTION_SAMPLE_RATE ÷ F0_CEIL)
 
 f0_scaling = 1 / log2(F0_CEIL)
 normalize_f0(f0) = log2.(max(f0, 1)) .* f0_scaling
@@ -90,10 +93,11 @@ end
 # we need to scale the integration step so that it's larger than the Δt between signal samples
 const LATENT_SPACE_SAMPLE_RATE_SCALER::Float32 = 1000
 
-struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :control, :encoder, :decoder)}
+struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :control, :encoder, :identity_decoder, :decoder)}
     feature_scanner::Lux.AbstractExplicitLayer
     control::Lux.AbstractExplicitLayer
     encoder::Lux.AbstractExplicitLayer
+    identity_decoder::Lux.AbstractExplicitLayer
     decoder::Lux.AbstractExplicitLayer
     ode::Lux.AbstractExplicitLayer
     ode_axes::Tuple
@@ -104,17 +108,12 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :co
     input_n::Integer
     output_n::Integer
 
-    sound_to_latent::Matrix{Float32}
-    latent_to_sound::Matrix{Float32}
-
     function hNODEVocoder(
         sample_rate;
-        # specify the number of returned samples
-        output_n = nothing,
         # whether or not to include the speaker model to go from eigenvoice to specific speaker
         speaker = true,
-        latent_to_sound_path = "latent_to_sound.bson",
-        sound_to_latent_path = "sound_to_latent.bson"
+        # specify the number of output samples, otherwise, the output is the same as the input
+        output_n = nothing
     )
         # analyzers to get MFCC, F0, aperiodicity, etc
         dio = DIO(F0_CEIL, F0_FLOOR, FEATURE_EXTRACTION_SAMPLE_RATE)
@@ -122,34 +121,21 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :co
         feature_scanner = FeatureScanner(dio, cheaptrick) |> Lux.StatefulRecurrentCell
 
         # input should contain enough samples to satisfy the analyzers' requirements
+        # output has the same length as input
         resampled_input_n = max(cheaptrick.max_frame_size, dio.frame_length)
-        input_dims = resample(Lux.zeros32(resampled_input_n), sample_rate / FEATURE_EXTRACTION_SAMPLE_RATE) |> length
+        N = resample(Lux.zeros32(resampled_input_n), sample_rate / FEATURE_EXTRACTION_SAMPLE_RATE) |> length
 
-        # the output should at least fit the period of the lowest frequency the system is expected to handle
-        # this can be adjusted with the output_multiplier parameter
-        output_n = isnothing(output_n) ? (sample_rate / F0_FLOOR) |> round |> Integer : output_n
-        broomhead_king
         # models to convert into and from the latent space
-        @load sound_to_latent_path sound_to_latent
-        @load latent_to_sound_path latent_to_sound
-        encoder = Lux.Chain(
-            x -> begin
-                sub_x = x[1:SVD_LATENT_DIMS,:]
-                svd_latent_x = sub_x' * sound_to_latent
-                svd_latent_x'
-            end,
-            Lux.Dense(SVD_LATENT_DIMS, LATENT_DIMS)
-        )
-        decoder = Lux.Chain(
-            Lux.Dense(LATENT_DIMS, SVD_LATENT_DIMS),
-            x -> begin
-                time_space_x = x' * latent_to_sound
-                time_space_x[:,1]'
-            end
-        )
-
+        encoder = Lux.Dense(N, LATENT_DIMS)
+        identity_decoder = Lux.Dense(LATENT_DIMS, N)
+        decoder = Lux.Dense(LATENT_DIMS, 1)
         # model to get trajectories inside the latent space
-        ode = AntisymmetricBlock(LATENT_DIMS, variable_power(0.5f0, 0.3f0, 5f0))
+        # assumes ther are linear plus non-linear parts to the signal
+        ode = Lux.Parallel(+;
+            name = "ode",
+            linear_block = Lux.Dense(LATENT_DIMS, LATENT_DIMS),
+            antisymmetric_block = Lux.Dense(LATENT_DIMS, LATENT_DIMS, variable_power(0.5f0, 0.5f0, 1f0))
+        )
         ode_axes = Lux.initialparameters(Random.default_rng(), ode) |> ComponentArray |> getaxes
         params_n = Lux.parameterlength(ode) + 1 # an extra parameter for the white noise level
 
@@ -175,16 +161,15 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :co
             feature_scanner,
             control,
             encoder,
+            identity_decoder,
             decoder,
             ode,
             ode_axes,
             FEATURE_EXTRACTION_SAMPLE_RATE / sample_rate,
             resample_filter(FEATURE_EXTRACTION_SAMPLE_RATE / sample_rate),
             sample_rate,
-            input_dims,
-            output_n,
-            sound_to_latent,
-            latent_to_sound
+            N,
+            isnothing(output_n) ? N : output_n
         )
     end
 end
@@ -201,6 +186,7 @@ Lux.initialstates(rng::AbstractRNG, m::hNODEVocoder) = begin
         feature_scanner = Lux.initialstates(rng, m.feature_scanner),
         control = Lux.initialstates(rng, m.control),
         encoder = Lux.initialstates(rng, m.encoder),
+        identity_decoder = Lux.initialstates(rng, m.identity_decoder),
         decoder = Lux.initialstates(rng, m.decoder),
         ode = Lux.initialstates(rng, m.ode),
         # ode integration config
@@ -240,14 +226,13 @@ function (m::hNODEVocoder)(sound::AbstractMatrix, ps, st)
     u0, st_encoder = m.encoder(sound, ps.encoder, st.encoder)
     return m((sound, (u0,)), ps, (st..., encoder = st_encoder, resampled = true))
 end
-using DynamicalSystems
+
 # second stage - extract the feature vector
 function (m::hNODEVocoder)(
     (sound, (u0,))::Tuple{<:AbstractMatrix, Tuple{<:AbstractMatrix}},
     ps,
     st::NamedTuple
 )
-DynamicalSystems.embed
     sound = resample_if_needed(m, sound, st)
     features, st_feature_scanner = m.feature_scanner(sound, ps.feature_scanner, st.feature_scanner)
 
@@ -256,7 +241,7 @@ end
 
 # third stage - use the feature vector to get the control for ode and integrate it using the embedded sound as u0
 function (m::hNODEVocoder)(
-    (_, (u0,features))::Tuple{<:AbstractMatrix, Tuple{<:AbstractMatrix, <:AbstractMatrix}},
+    (_, (u0, features))::Tuple{<:AbstractMatrix, Tuple{<:AbstractMatrix, <:AbstractMatrix}},
     ps,
     st::NamedTuple
 )
@@ -279,7 +264,7 @@ function (m::hNODEVocoder)(
         for i ∈ 1:size(features)[2]
     ] |> unzip
 
-    return (ys, (reduce(hcat, un),)), (st..., resampled = false)
+    return (cat([y' for y ∈ ys]..., dims=3), (hcat(un...),)), (st..., resampled = false)
 end
 
 fft_matrix(x) = begin

@@ -1,13 +1,15 @@
 using Optimisers, Zygote, Lux, MLUtils
 
+unixepoch() = datetime2unix(now()) |> round |> Int
+
 function time_series_to_latent(encoder, ps, st, series::Vector, chunk_size::Int)
-    return vcat([
+    return reduce(vcat, [
         begin
             latent, st_encoder = encoder(chunk, ps, st)
             latent'
         end
         for chunk ∈ chunk_data([series;;], chunk_size)
-    ]...)
+    ])
 end
 
 function latent_to_time_series(decoder, ps, st, latent_points::Matrix)
@@ -31,7 +33,7 @@ end
 function chunk_data(data::Matrix, chunk_size::Int; step::Int = 1)
     return [
         view(data, i:i+chunk_size-1, :)
-        for i ∈ 1:step:size(data)[1]-chunk_size
+        for i ∈ 1:step:size(data)[1]-chunk_size+1
     ]
 end
 
@@ -61,7 +63,8 @@ function train(
 )
     tstate = init_training_state(model, ps, st, optimiser)
     zygote = Lux.Training.AutoZygote()
-    for epoch ∈ 1:epochs
+    epoch = 1
+    while epoch <= epochs || (!isnothing(epoch_cb) && epoch_cb(loss_function, epoch, model, tstate.parameters, tstate.states))
         for batch ∈ data
             try
                 if !isnothing(init_state)
@@ -77,9 +80,7 @@ function train(
             end
         end
 
-        if !isnothing(epoch_cb)
-            epoch_cb(loss_function, epoch, tstate.parameters, tstate.states)
-        end
+        epoch += 1
     end
 
     return tstate.parameters, tstate.states
