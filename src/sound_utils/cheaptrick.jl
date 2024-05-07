@@ -29,6 +29,7 @@ struct CheapTrick
         window = hanning(default_frame_size)
         spectrum_zeros_safeguard = rand(fft_size)
         spectrum_zeros_safeguard ./= min((spectrum_zeros_safeguard ./ eps())...)
+        spectrogram(rand(10))
         new(
             f0_ceil,
             f0_floor,

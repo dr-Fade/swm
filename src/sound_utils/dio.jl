@@ -1,19 +1,21 @@
 using LinearAlgebra, SignalAnalysis, DSP
 
+const F0Estimate = @NamedTuple{value::Float32, confidence::Float32, loudness::Float32}
+
 struct DIO
-    f0_ceil::Float64
-    f0_floor::Float64
+    f0_ceil::Float32
+    f0_floor::Float32
     sample_rate::Integer
-    decimation_rate::Float64
+    decimation_rate::Float32
     frame_length::Int
-    lowpass_filters::Vector{Vector{Float64}}
-    resample_filter::Vector{Float64}
+    lowpass_filters::Vector{Vector{Float32}}
+    resample_filter::Vector{Float32}
     τ_min::Int
     τ_max::Int
-    relative_peak_threshold::Float64
-    noise_floor::Float64
+    relative_peak_threshold::Float32
+    noise_floor::Float32
     DIO(f0_ceil, f0_floor, sample_rate; relative_peak_threshold = 0.5, noise_floor = 0.01) = begin
-        frame_length = (2sample_rate / f0_floor) |> round |> Int
+        frame_length = (3sample_rate / f0_floor) |> round |> Int
         window_width = 2 * DOWNSAMPLED_RATE / f0_ceil |> floor |> Int
         window = window_width |> round |> Int |> hanning |> FIRWindow
         filters = [
@@ -41,16 +43,17 @@ struct DIO
 end
 
 # wrapper over DSP.resample to allow currying for composability
-decimate(dio::DIO) = sample ->
+decimate(dio::DIO) = sample -> 
     resample(sample, dio.decimation_rate, dio.resample_filter)
 
 # wrapper over SignalAnalysis.removedc to allow currying for composability
-remove_dc(cutoff_freq) = sample -> removedc(sample; α = cutoff_freq)
+remove_dc() = sample ->
+    removedc(sample; α=0.95f0)
 
 # run through the sample with the RMA filter to attenuate harmonics
 attenuate_harmonics(dio::DIO) = sample -> begin
     y = sample
-    res = Vector{Vector{Float64}}()
+    res = Vector{Vector{Float32}}()
     for filter ∈ dio.lowpass_filters
         y = filt(filter, y |> reverse) |> reverse
         res = [res; [y]]
@@ -58,10 +61,10 @@ attenuate_harmonics(dio::DIO) = sample -> begin
     res |> reverse
 end
 
-const Point2d = Tuple{Float64, Float64}
+const Point2d = Tuple{Float32, Float32}
 
 # find where line between p1 and p2 intersects the X axis
-find_zero_intersection(p1::Tuple, p2::Tuple)::Float64 = begin
+find_zero_intersection(p1::Tuple, p2::Tuple)::Float32 = begin
     x1, y1 = p1
     x2, y2 = p2
     -y1 * (x2 - x1) / (y2 - y1) + x1
@@ -91,7 +94,7 @@ end
 # util function that tries to find the first point that satisfies the current_detector.
 # if a point is found, its index is returned with the range offset, e.g., if the point was
 # searched for in 53:360 and was found at index 4, then the function will return 57.
-apply_detector(dio::DIO, range::UnitRange, sample::Vector, noise_floor::Float64, detector::Symbol, previous_peak=nothing)::Union{Int64, Nothing} = begin
+apply_detector(dio::DIO, range::UnitRange, sample::Vector{Float32}, noise_floor::Float32, detector::Symbol, previous_peak=nothing)::Union{Int64, Nothing} = begin
     safe_range = range[dio.τ_min:min(dio.τ_max, length(range)-1)]
     res = if detector == :find_negative_peak
         findfirst(
@@ -141,13 +144,17 @@ get_next_detector(detector) =
 full_period = 2length(detectors)
 
 # apply the current detector to a range and continue the search with the next detector in the chain until depth is reached
-apply_detectors_chain(dio::DIO, range::UnitRange{Int64}, sample::Vector{Float64}, noise_floor::Float64, depth::Int = 1, previous_peak = nothing; detector = nothing)::Union{Vector{Union{Float64, Nothing}}, Nothing} = begin
+apply_detectors_chain(dio::DIO, range::UnitRange{Int64}, sample::Vector{Float32}, noise_floor::Float32, depth::Int = 1, previous_peak = nothing; detector = nothing)::Union{Vector{Union{Float32, Nothing}}, Nothing} = begin
     res = nothing
 
     # attempt find initial detector
     if isnothing(detector)
+        # only search in the vicinity of the largest/lowest peak
+        init_range = sample[1:end-Int(2*DOWNSAMPLED_RATE÷dio.f0_floor)]
+        start_index = max(min(findmax(init_range)[2], findmin(init_range)[2]) - Int(DOWNSAMPLED_RATE÷dio.f0_floor÷4), 1)
+        end_index = start_index + 2dio.τ_max
         for d ∈ detectors
-            for i ∈ 1:dio.τ_min:2dio.τ_max
+            for i ∈ start_index:dio.τ_min:end_index
                 r = apply_detector(dio, i:range[end], sample, noise_floor, d)
                 if !isnothing(r) && (isnothing(res) || r < res)
                     detector = d
@@ -192,15 +199,15 @@ apply_detectors_chain(dio::DIO, range::UnitRange{Int64}, sample::Vector{Float64}
     end
 end
 
-detect_pitch(dio::DIO) = sample::Vector{Float64} -> begin
+detect_pitch(dio::DIO) = sample::Vector{Float32} -> begin
     rms_sample = rms(sample)
     if rms_sample < dio.noise_floor
-        return (0.0, 0.0)
+        return (value=0f0, confidence=0f0, loudness=0f0)
     end
 
     noise_floor = max(rms_sample / 4, dio.noise_floor)
 
-    f0, Λ = 0.0, 0.0
+    f0, Λ = 0f0, 0f0
 
     range = 1:length(sample)
     detected_points = apply_detectors_chain(dio, range, sample, noise_floor, full_period)
@@ -211,33 +218,57 @@ detect_pitch(dio::DIO) = sample::Vector{Float64} -> begin
         f0 = 1 / T
     end
 
-    f0, Λ
+    (value=f0, confidence=Λ, loudness=0f0)
 end
 
 # find the f0 estimation with the highest likelihood value λ and lowest distance from the previous estimate
-select_candidate(previous_estimate::Tuple{Float64, Float64} = (0.0, 0.0); threshold::Float64 = 0.75) = estimates::Vector{Tuple{Float64, Float64}} -> begin
-    prev_f0, prev_λ = previous_estimate
-    valid_estimates = filter(((f0, λ),) -> λ > threshold, estimates)
-    if isempty(valid_estimates)
-        return (0.0, 0.0)
+select_candidate(previous_estimate::F0Estimate = (value=0f0, confidence=0f0, loudness=0f0), loudness = 0f0; threshold = 0.75f0) = estimates::Vector{F0Estimate} -> begin
+    valid_estimates = filter(estimate -> estimate.confidence > threshold, estimates)
+    return if isempty(valid_estimates)
+        (value=0f0, confidence=0f0, loudness=loudness)
+    else
+        _, idx = findmin(estimate -> abs(estimate.value - previous_estimate.value) / estimate.confidence, valid_estimates)
+        valid_estimates[idx]
     end
-    _, idx = findmin(((f0, λ),) -> abs(f0 - prev_f0) + λ, valid_estimates)
-    valid_estimates[idx]
 end
 
-const DOWNSAMPLED_RATE = 4000.0
-const DC_THRESHOLD = 0.9
+fix_candidate(
+    previous_estimate::F0Estimate = (value=0f0, confidence=0f0, loudness=0f0),
+    loudness = 0f0,
+    noise_floor = 0.01f0,
+    frequency_change_tolerance = 0.5f0
+) = estimate::F0Estimate -> begin
+    if estimate.confidence < previous_estimate.confidence && loudness > noise_floor
+        max_f0 = max(previous_estimate.value, estimate.value)
+        min_f0 = max(min(previous_estimate.value, estimate.value), 1f0)
+        max_loudness = max(previous_estimate.loudness, loudness)
+        min_loudness = max(min(previous_estimate.loudness, loudness), noise_floor)
+
+        f0_change_rate = round(max_f0 / min_f0; digits = 2)
+        loudness_change_rate = round(max_loudness / min_loudness; digits = 2)
+        if f0_change_rate > loudness_change_rate
+            estimate = previous_estimate
+        end
+    elseif previous_estimate.value > 0 && 1 - frequency_change_tolerance ≤ log2(max(estimate.value / previous_estimate.value, 1f0))
+        estimate = previous_estimate
+    end
+
+    return (estimate..., loudness = loudness)
+end
+
+const DOWNSAMPLED_RATE = 4000f0
 
 # the algorithm is lifted straight from the article:
 # https://www.isca-speech.org/archive/pdfs/interspeech_2016/daido16_interspeech.pdf
-(dio::DIO)(sample::Vector; previous_estimate::Tuple{Float64, Float64} = (0.0, 0.0)) = sample |>
+(dio::DIO)(sample::Vector{Float32}; previous_estimate::F0Estimate = (value=0f0, confidence=0f0, loudness=0f0)) = sample |>
     decimate(dio) |>
-    remove_dc(DC_THRESHOLD) |>
+    remove_dc() |>
     attenuate_harmonics(dio) .|>
     detect_pitch(dio) |>
-    select_candidate(previous_estimate)
+    select_candidate(previous_estimate) |>
+    fix_candidate(previous_estimate, rms(sample))
 
-parallel_pitch_detection(dio::DIO, hop::Float64) = sound::Vector{Float64} -> begin
+parallel_pitch_detection(dio::DIO, hop::Float32) = sound::Vector{Float32} -> begin
     hop_size = (hop * (DOWNSAMPLED_RATE / 1000)) |> round |> Int
     frame_size = dio.frame_length * dio.decimation_rate |> floor |> Int
     [
@@ -255,10 +286,10 @@ parallel_pitch_detection(dio::DIO, hop::Float64) = sound::Vector{Float64} -> beg
     ]
 end
 
-select_candidates(estimates::Vector{Vector{Tuple{Float64, Float64}}}) = begin
+select_candidates(estimates::Vector{Vector{F0Estimate}}) = begin
     N = estimates[1] |> length
     prev_estimate = (0.0, 0.0)
-    contour = Vector{Tuple{Float64, Float64}}(undef, N)
+    contour = Vector{Tuple{Float32, Float32}}(undef, N)
     for i ∈ 1:N
         candidates = [estimates[j][i] for j ∈ eachindex(estimates)]
         if i > 1
@@ -270,7 +301,7 @@ select_candidates(estimates::Vector{Vector{Tuple{Float64, Float64}}}) = begin
 end
 
 # return an estimated f0 curve and time axis at which the values were detected
-dio_contour(dio::DIO, sound::Vector{Float64}; hop::Float64 = 1.0)::Vector{Tuple{Float64, Float64}} = sound |>
+dio_contour(dio::DIO, sound::Vector{Float32}; hop::Float32 = 1.0)::Vector{Tuple{Float32, Float32}} = sound |>
     decimate(dio) |>
     remove_dc(DC_THRESHOLD) |>
     attenuate_harmonics(dio) .|>

@@ -1,4 +1,4 @@
-using Optimisers, Zygote, Lux, MLUtils
+using Optimisers, Zygote, Lux, MLUtils, ADTypes
 
 unixepoch() = datetime2unix(now()) |> round |> Int
 
@@ -57,27 +57,31 @@ function train(
     st = nothing,
     batch_cb = nothing,
     epoch_cb = nothing,
-    init_state = nothing,
     epochs = 1,
-    optimiser = Optimisers.Adam()
+    optimiser = Optimisers.Adam(),
+    states_to_clear = (:carry,)
 )
     tstate = init_training_state(model, ps, st, optimiser)
-    zygote = Lux.Training.AutoZygote()
+    zygote = ADTypes.AutoZygote()
     epoch = 1
-    while epoch <= epochs || (!isnothing(epoch_cb) && epoch_cb(loss_function, epoch, model, tstate.parameters, tstate.states))
-        for batch ∈ data
+    batch_N = length(data)
+    while epoch <= epochs
+        for (batch_i, batch) ∈ enumerate(data)
             try
-                if !isnothing(init_state)
-                    Lux.@set! tstate.states = init_state(batch, ps, st)
-                end
-                grads, loss, stats, tstate = Lux.Training.compute_gradients(zygote, loss_function, batch, tstate)
-                tstate = Lux.Training.apply_gradients(tstate, grads)
-                if !isnothing(batch_cb)
-                    batch_cb(loss_function, tstate.parameters, tstate.states)
-                end
+                grads, loss, stats, tstate = Lux.Experimental.compute_gradients(zygote, loss_function, batch, tstate)
+                tstate = Lux.Experimental.apply_gradients(tstate, grads)
             finally
-                Lux.@set! tstate.states = Lux.update_state(tstate.states, :carry, nothing)
+                for state in states_to_clear
+                    Lux.@set! tstate.states = Lux.update_state(tstate.states, state, nothing)
+                end
             end
+            if !isnothing(batch_cb)
+                batch_cb(loss_function, model, tstate.parameters, tstate.states, batch_i, batch_N, epoch)
+            end
+        end
+
+        if !isnothing(epoch_cb) && epoch_cb(loss_function, epoch, epochs, model, tstate.parameters, tstate.states)
+            break
         end
 
         epoch += 1

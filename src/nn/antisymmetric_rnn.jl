@@ -1,4 +1,4 @@
-using Lux, Random, LinearAlgebra, CUDA
+using Lux, Random, LinearAlgebra
 
 struct AntisymmetricRNN{A, B, W, S} <: Lux.AbstractRecurrentCell{true, false}
     n::Int

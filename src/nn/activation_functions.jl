@@ -8,4 +8,15 @@ variable_power(α, β, c) = u -> begin
     end
 end
 
+# α == β == c == 0.5
+sqrt_activation(u) = begin
+    if u < -4
+        2 - 2*sqrt(-u)
+    elseif u ≤ 4
+        u / 2
+    else
+        -2 + 2sqrt(u)
+    end
+end
+
 abs_square(params) = x -> x*abs(x)

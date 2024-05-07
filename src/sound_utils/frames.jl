@@ -1,27 +1,28 @@
-using WORLD
 include("dio.jl")
 include("cheaptrick.jl")
 
 const MFCC_SIZE = 20
 
-function get_features(frame::Vector{Float32}, dio::DIO, cheaptrick::CheapTrick, prev_f0_estimate = (0.0, 0.0))
-    frame = frame |> Vector{Float64}
-    # f0
-    f0 = dio(frame; previous_estimate = prev_f0_estimate)
-    # spectral part
-    spectrogram = cheaptrick(f0[1], frame)
-    mc = sp2mc(spectrogram, MFCC_SIZE, 0.41)[2:end]
-    # aperiodicity
-    aperiodicity = d4c(frame, dio.sample_rate, [0.0], [f0[1]])
-    coded_aperiodicity = code_aperiodicity(aperiodicity, dio.sample_rate)
+function get_features(frame, dio::DIO, prev_f0 = (value=0f0, confidence=0f0, loudness=0f0))
     # dynamics
     loudness = rms(frame)
+    # f0
+    f0 = dio(frame; previous_estimate = prev_f0)
+    # spectral part
+    spectrogram = DSP.periodogram(frame; nfft=1024, fs = dio.sample_rate, window=blackman).power .+ eps()
+    mc = sp2mc(spectrogram, MFCC_SIZE, 0.41)
+    # aperiodicity
+    aperiodicity = d4c(Vector{Float64}(frame), dio.sample_rate, [0.0], [Float64(f0[1])])
+    coded_aperiodicity = code_aperiodicity(aperiodicity, dio.sample_rate)
+    if any(isnan, coded_aperiodicity)
+        coded_aperiodicity = [-eps();;]
+    end
 
     return loudness, f0, mc, coded_aperiodicity, spectrogram
 end
 
-function get_flat_features(frame, dio, cheaptrick)
-    loudness, f0, mc, coded_aperiodicity, _ = get_features(frame, dio, cheaptrick)
+function get_flat_features(frame, dio)
+    loudness, f0, mc, coded_aperiodicity, _ = get_features(frame, dio)
     return [loudness; f0[1]; mc; coded_aperiodicity][:,1] |> Vector{Float32}
 end
 
