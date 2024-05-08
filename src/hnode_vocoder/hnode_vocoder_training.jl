@@ -61,7 +61,10 @@ psum(f, xs) = begin
     return res
 end
 
-function train_final_model(model::hNODEVocoder, ps, st::NamedTuple, training_data; batchsize = 1, slices = 1, epochs = 1, epoch_cb = nothing, batch_cb = nothing, optimiser = Optimisers.Adam())
+function train_final_model(
+    model::hNODEVocoder, ps, st::NamedTuple, training_data;
+    batchsize = 1, slices = 1, epochs = 1, epoch_cb = nothing, batch_cb = nothing, optimiser = Optimisers.Adam(), distributed_backend = nothing
+)
     output_n = model.output_n
 
     st = (st..., resampled = true)
@@ -95,15 +98,21 @@ function train_final_model(model::hNODEVocoder, ps, st::NamedTuple, training_dat
 
         raw_loss = sum(abs2, 100*(generated_sound .- target_sound)) / slices
 
-        generated_fft = log10.((abs2.(fft(generated_sound .* window, 1)[1:end÷2,:]) .+ eps()))
-        target_fft = log10.((abs2.(fft(target_sound .* window, 1)[1:end÷2,:]) .+ eps()))
+        spectral_loss = if length(generated_sound) ≥ 512
+            generated_fft = log10.((abs2.(fft(generated_sound .* window, 1)[1:end÷2,:]) .+ eps()))
+            target_fft = log10.((abs2.(fft(target_sound .* window, 1)[1:end÷2,:]) .+ eps()))
 
-        spectral_loss = sum(abs2, generated_fft .- target_fft)
-
+            sum(abs2, generated_fft .- target_fft)
+        else
+            0f0
+        end
         return (regularization_loss + raw_loss + spectral_loss) / batchsize, st, (nothing,)
     end
 
-    ps, st = train(model, loader, loss_function; ps = ps, st = st, epochs = epochs, optimiser = optimiser, epoch_cb = epoch_cb, batch_cb = batch_cb, states_to_clear = (:carry, :prev_features))
+    ps, st = train(
+        model, loader, loss_function;
+        ps = ps, st = st, epochs = epochs, optimiser = optimiser, epoch_cb = epoch_cb, batch_cb = batch_cb, states_to_clear = (:carry, :prev_features), distributed_backend = distributed_backend
+    )
 
     return ps, st
 end

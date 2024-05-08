@@ -11,7 +11,7 @@ function get_dirs_with_sound(root; file_extensions = [".flac", ".wav"])
 end
 
 # load and resample all sounds for training from directories
-function load_sounds(target_dirs...; file_limit_per_dir = nothing, silent = false, target_sample_rate = 16000)
+function load_sounds(target_dirs...; file_limit_per_dir = nothing, verbose = true, target_sample_rate = 16000, shuffle_files=false)
     fade_duration = (target_sample_rate * 0.1) |> Int # 100 millis
     w = DSP.Windows.hanning(2*fade_duration)
     fade_in = w[1:fade_duration]
@@ -19,8 +19,8 @@ function load_sounds(target_dirs...; file_limit_per_dir = nothing, silent = fals
 
     result = vcat([
         begin
-            silent || println("loading files from $(target_dir)...")
-            files = shuffle(readdir(target_dir; join = true))
+            verbose && println("loading files from $(target_dir)...")
+            files = readdir(target_dir; join = true) |> (shuffle_files ? shuffle : identity)
 
             [
                 begin

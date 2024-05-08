@@ -37,14 +37,19 @@ function chunk_data(data::Matrix, chunk_size::Int; step::Int = 1)
     ]
 end
 
-function init_training_state(model, ps, st, optimiser)
+function init_training_state(model, ps, st, optimiser, distributed_backend=nothing)
     rng = Random.default_rng()
-    tstate = Lux.Training.TrainState(rng, model, optimiser)
+    tstate = Lux.Training.TrainState(rng, model, isnothing(distributed_backend) ? optimiser : DistributedUtils.DistributedOptimizer(distributed_backend, optimiser))
     if !isnothing(ps)
         Lux.@set! tstate.parameters = ps
     end
     if !isnothing(st)
         Lux.@set! tstate.states = st
+    end
+    if !isnothing(distributed_backend)
+        Lux.@set! tstate.parameters = DistributedUtils.synchronize!!(distributed_backend, tstate.parameters)
+        Lux.@set! tstate.states = DistributedUtils.synchronize!!(distributed_backend, tstate.states)
+        Lux.@set! tstate.optimizer_state = DistributedUtils.synchronize!!(distributed_backend, tstate.optimizer_state)
     end
     return tstate
 end
@@ -59,13 +64,14 @@ function train(
     epoch_cb = nothing,
     epochs = 1,
     optimiser = Optimisers.Adam(),
-    states_to_clear = (:carry,)
+    states_to_clear = (:carry,),
+    distributed_backend = nothing
 )
-    tstate = init_training_state(model, ps, st, optimiser)
+    tstate = init_training_state(model, ps, st, optimiser, distributed_backend)
     zygote = ADTypes.AutoZygote()
     epoch = 1
     batch_N = length(data)
-    while epoch <= epochs
+    while epoch <= epochs    
         for (batch_i, batch) ∈ enumerate(data)
             try
                 grads, loss, stats, tstate = Lux.Experimental.compute_gradients(zygote, loss_function, batch, tstate)
@@ -86,6 +92,8 @@ function train(
 
         epoch += 1
     end
-
+    if !isnothing(distributed_backend)
+        println("worker $(DistributedUtils.local_rank(distributed_backend)): done!")
+    end
     return tstate.parameters, tstate.states
 end

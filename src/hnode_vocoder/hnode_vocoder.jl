@@ -1,84 +1,61 @@
 using BSON: @load, @save
-using DynamicalSystems
+using DynamicalSystems, DifferentialEquations, ComponentArrays, DiffEqFlux
 
 include("../nn/unitary_block.jl")
-include("../sound_utils/frames.jl")
+include("../nn/activation_functions.jl")
+include("../sound_utils/dio.jl")
+include("../sound_utils/mel.jl")
 
 const FEATURE_EXTRACTION_SAMPLE_RATE::Int32 = 16000
 const LATENT_DIMS = 10
 
+const F0_CEIL::Float32 = 600f0
+const F0_FLOOR::Float32 = 60f0
+
+# the ode trajectories may evolve much slower than the actual time domain signal
+# we need to scale the integration step so that it's larger than the Δt between signal samples
+const LATENT_SPACE_SAMPLE_RATE_SCALER::Float32 = 1000
+
+
 # the scanner is a recurrent network because DIO requires f0 info from the previous frame
 struct FeatureScanner <: Lux.AbstractRecurrentCell{false, false}
     dio::DIO
+    mfcc_filter_bank::Matrix{Float32}
+    input_n::Int
+    output_n::Int
+
+    function FeatureScanner()
+        dio = DIO(F0_CEIL, F0_FLOOR, FEATURE_EXTRACTION_SAMPLE_RATE; noise_floor = 0.01)
+        fftn = nextfastfft(dio.frame_length)
+        fftfreq = rfftfreq(fftn, FEATURE_EXTRACTION_SAMPLE_RATE)
+        mfcc_filter_bank = get_mel_filter_banks(Vector{Float32}(fftfreq))
+        return new(dio, mfcc_filter_bank, dio.frame_length, size(mfcc_filter_bank)[1]+2)
+    end
 end
 
-const F0_CEIL::Float32 = 600f0
-const F0_FLOOR::Float32 = 60f0
-const ENCODER_INPUT_N::Integer = Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ F0_FLOOR ÷ 2)
-
-function (fs::FeatureScanner)(xs::AbstractMatrix, ps, st)
+function (fs::FeatureScanner)(xs::AbstractMatrix, ps, st::NamedTuple)
     return fs((xs, (repeat([(value=0f0, confidence=0f0, loudness=0f0)], size(xs)[2]),)), ps, st)
 end
 
 @load "$(@__DIR__)/feature_means.bson" feature_means
 @load "$(@__DIR__)/feature_stds.bson" feature_stds
 
+unzip(a) = map(x->getfield.(a, x), fieldnames(eltype(a)))
+
 function (fs::FeatureScanner)((xs, (previous_f0s,))::Tuple{<:AbstractMatrix, Tuple{Vector{F0Estimate}}}, ps, st::NamedTuple)
     ys, f0s = [
         begin
-            loudness, f0, mc, coded_aperiodicity, _ = get_features(x[:,1], fs.dio, f0)
-            (([loudness; f0[1]; mc; coded_aperiodicity][:,1] |> Vector{Float32}) .- feature_means) ./ feature_stds, f0, loudness
+            f0 = fs.dio(Vector(x); previous_estimate = f0)
+            spectrogram = DSP.periodogram(x; fs = fs.dio.sample_rate, window=blackman)
+            mc = mfcc(spectrogram; filter_bank = fs.mfcc_filter_bank)
+
+            (([f0...; mc]) .- feature_means) ./ feature_stds, f0
         end
         for (x, f0) ∈ zip(eachcol(xs), previous_f0s)
     ] |> unzip
 
     return (reduce(hcat, ys), (f0s,)), st
 end
-
-
-struct RollingFilter <: Lux.AbstractRecurrentCell{false, false}
-    filter::Lux.AbstractExplicitLayer
-    parameter_generator::Lux.AbstractExplicitLayer
-    filter_axes::Tuple
-    Δt::Float32
-
-    function RollingFilter(n; Δt=1.0f0)
-        filter = Lux.SkipConnection(Lux.Dense(n, n), +)
-        filter_axes = Lux.initialparameters(Random.default_rng(), filter) |> ComponentArray |> getaxes
-        filter_params_n = Lux.parameterlength(filter)
-
-        parameter_generator = Lux.Chain(
-            Lux.Dense(n, filter_params_n, sqrt_activation),
-            Lux.Dense(filter_params_n, filter_params_n)
-        )
-
-        return new(filter, parameter_generator, filter_axes, Δt)
-    end
-end
-
-Lux.initialparameters(rng::AbstractRNG, m::RollingFilter) = (
-    parameter_generator = Lux.initialparameters(rng, m.parameter_generator),
-)
-
-Lux.initialstates(rng::AbstractRNG, m::RollingFilter) = (
-    rng = Lux.replicate(rng),
-    filter = Lux.initialstates(rng, m.filter),
-    parameter_generator = Lux.initialstates(rng, m.parameter_generator)
-)
-
-function (m::RollingFilter)(x::AbstractMatrix, ps, st)
-    return (x, (x,)), ps, st
-end
-
-function (m::RollingFilter)((x, (carry,))::Tuple{<:AbstractMatrix, Tuple{<:AbstractMatrix}}, ps, st)
-    filter_params, generator_st = m.parameter_generator(m.Δt.*(x .- carry), ps.parameter_generator, st.parameter_generator)
-    filtered_result, filter_st = m.filter(x, ComponentArray(vec(filter_params), m.filter_axes), st.filter)
-    return (filtered_result, (filtered_result,)), (st..., filter = filter_st, parameter_generator = generator_st)
-end
-
-# the ode trajectories may evolve much slower than the actual time domain signal
-# we need to scale the integration step so that it's larger than the Δt between signal samples
-const LATENT_SPACE_SAMPLE_RATE_SCALER::Float32 = 1000
 
 struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :control, :encoder, :decoder)}
     feature_scanner::Lux.AbstractExplicitLayer
@@ -103,16 +80,14 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :co
         speaker = true
     )
         # analyzers to get MFCC, F0, aperiodicity, etc
-        dio = DIO(F0_CEIL, F0_FLOOR, FEATURE_EXTRACTION_SAMPLE_RATE; noise_floor = 0.01)
-        feature_scanner = FeatureScanner(dio) |> Lux.StatefulRecurrentCell
+        feature_scanner = FeatureScanner()
 
         # input should contain enough samples to satisfy the analyzers' requirements
         # output has the same length as input
-        resampled_input_n = dio.frame_length
-        N = resample(Lux.zeros32(resampled_input_n), sample_rate / FEATURE_EXTRACTION_SAMPLE_RATE) |> length
+        resampled_input_n = feature_scanner.input_n
 
         # models to convert into and from the latent space
-        encoder_input = Int(2*FEATURE_EXTRACTION_SAMPLE_RATE÷F0_FLOOR)
+        encoder_input = Int(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_FLOOR)
         conv_kernel_size = Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ F0_CEIL)
         conv_output_dims = encoder_input - conv_kernel_size + 1
         encoder = Lux.Chain(
@@ -136,39 +111,32 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :co
         params_n = Lux.parameterlength(ode)
 
         # infer the basic parameters from features to generate time-domain signal
-        features_n = get_flat_features(Lux.zeros32(resampled_input_n), dio) |> length
-
         Δt = LATENT_SPACE_SAMPLE_RATE_SCALER / sample_rate
         T = output_n * Δt
 
         base_control = Lux.Chain(
-            Lux.Dense(features_n, params_n, sqrt_activation),
+            Lux.Dense(feature_scanner.output_n, params_n, sqrt_activation),
             Lux.Dense(params_n, params_n)
         )
 
         # derive the required modulation to the base control from the input features to arrive at the wanted speaker
         speaker_control = if speaker
-            Lux.Chain(
-                Lux.Dense(features_n, params_n, sqrt_activation),
+            speaker_chain = Lux.Chain(
+                Lux.Dense(params_n, params_n, sqrt_activation),
                 Lux.Dense(params_n, params_n)
             )
+            Lux.SkipConnection(speaker_chain, +)
         else
-            Lux.WrappedFunction(x ->
-                if isa(x, Vector)
-                    zeros(Float32, params_n)
-                else
-                    zeros(Float32, params_n, size(x)[2])
-                end
-            )
+            Lux.WrappedFunction(identity)
         end
 
-        control = Lux.Parallel(+;
+        control = Lux.Chain(;
             base_control = base_control,
             speaker_control = speaker_control
         )
 
         return new(
-            feature_scanner,
+            feature_scanner |> Lux.StatefulRecurrentCell,
             control,
             encoder,
             decoder,
@@ -177,7 +145,7 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :co
             FEATURE_EXTRACTION_SAMPLE_RATE / sample_rate,
             resample_filter(FEATURE_EXTRACTION_SAMPLE_RATE / sample_rate),
             sample_rate,
-            N,
+            resample(Lux.zeros32(resampled_input_n), sample_rate / FEATURE_EXTRACTION_SAMPLE_RATE) |> length,
             output_n,
             Δt,
             T
