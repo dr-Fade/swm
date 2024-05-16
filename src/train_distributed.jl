@@ -27,7 +27,7 @@ root_log("initialized $total_workers workers")
 # load the model and parameters
 include("hnode_vocoder/hnode_vocoder_training.jl");
 
-model = hNODEVocoder(FEATURE_EXTRACTION_SAMPLE_RATE; output_n = 2*Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ 1000), speaker = false)
+model = hNODEVocoder(FEATURE_EXTRACTION_SAMPLE_RATE; output_n = 5*Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ 1000), speaker = false)
 
 rng = Random.default_rng()
 model_filename = ARGS[1]
@@ -49,8 +49,8 @@ test_data_dir = "src/samples/LibriSpeech/test"
 # load files on the root worker and broadcast to everyone else
 sounds = MPI.bcast(
     vcat(
-        load_sounds(synthetic_data; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, verbose = local_rank==0),
-        load_sounds(dev_voice_sounds; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, file_limit_per_dir = 1, verbose = local_rank==0)
+        load_sounds(synthetic_data; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, verbose = local_rank==0, shuffle_files = true),
+        load_sounds(dev_voice_sounds; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, file_limit_per_dir = 4, verbose = local_rank==0, shuffle_files = true)
     ),
     backend.comm
 )
@@ -69,14 +69,18 @@ N = MPI.bcast(N, backend.comm)
 concatenated_sounds = concatenated_sounds[1:N]
 
 training_data = get_training_data(model, concatenated_sounds, FEATURE_EXTRACTION_SAMPLE_RATE)
+denoising_training_data = get_denoising_training_data(model; noise_length=max(length(concatenated_sounds)÷20, 1024))
 
 log("loaded $(size(training_data[1])[2]) training samples")
+log("loaded $(size(denoising_training_data[1])[2]) denoising training samples")
+
+training_data = (hcat(training_data[1], denoising_training_data[1]), hcat(training_data[2], denoising_training_data[2]))
 
 test_data = nothing
 test_sound = nothing
 
 if local_rank == 0
-    test_data = get_training_data(model, vcat(load_sounds(test_data_dir)...), FEATURE_EXTRACTION_SAMPLE_RATE)
+    test_data = get_training_data(model, vcat(load_sounds(test_data_dir; lowpass=1000f0)...), FEATURE_EXTRACTION_SAMPLE_RATE)
     test_sound = vcat(eachcol(test_data[1][1:model.output_n,:])...)
     log("loaded $(size(test_data[1])[2]) test samples")
 end
@@ -124,10 +128,11 @@ function batch_cb(loss_function, model, ps, st, batch_i, batch_n, epoch)
         error("NAN encountered")
     end
     if batch_i == batch_n || batch_i % 100 == 0
-        root_log("CHECKPOINT, saved params to $model_filename")
+        log_str = "$(now()): epoch $epoch, batch $batch_i/$batch_n"
+        root_log(log_str)
         @save model_filename ps
         open("training_log.txt","a") do file
-            println(file,"$(now()): epoch $epoch, batch $batch_i/$batch_n")
+            println(file, log_str)
         end
     end
 
@@ -138,7 +143,7 @@ ps, st = train_final_model(
     model, ps, st,
     training_data;
     batchsize = 16,
-    slices = 2,
+    slices = 10,
     optimiser = Optimisers.ADAM(1e-4),
     epochs = 1,
     epoch_cb = epoch_cb,

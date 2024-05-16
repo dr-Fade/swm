@@ -5,6 +5,7 @@ include("../nn/unitary_block.jl")
 include("../nn/activation_functions.jl")
 include("../sound_utils/dio.jl")
 include("../sound_utils/mel.jl")
+include("../sound_utils/stream_filter.jl")
 
 const FEATURE_EXTRACTION_SAMPLE_RATE::Int32 = 16000
 const LATENT_DIMS = 10
@@ -19,17 +20,25 @@ const LATENT_SPACE_SAMPLE_RATE_SCALER::Float32 = 1000
 
 # the scanner is a recurrent network because DIO requires f0 info from the previous frame
 struct FeatureScanner <: Lux.AbstractRecurrentCell{false, false}
+    stream_filter::StreamFilter
     dio::DIO
     mfcc_filter_bank::Matrix{Float32}
     input_n::Int
+    hop_size::Int
     output_n::Int
 
-    function FeatureScanner()
+    function FeatureScanner(hop_size::Int)
         dio = DIO(F0_CEIL, F0_FLOOR, FEATURE_EXTRACTION_SAMPLE_RATE; noise_floor = 0.01)
         fftn = nextfastfft(dio.frame_length)
         fftfreq = rfftfreq(fftn, FEATURE_EXTRACTION_SAMPLE_RATE)
         mfcc_filter_bank = get_mel_filter_banks(Vector{Float32}(fftfreq))
-        return new(dio, mfcc_filter_bank, dio.frame_length, size(mfcc_filter_bank)[1]+2)
+
+        Nh = Int(2*FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL)
+        println(Nh)
+        fir_filter = FIRFilter(digitalfilter(DSP.Bandpass(F0_FLOOR, 2*F0_CEIL; fs=FEATURE_EXTRACTION_SAMPLE_RATE), FIRWindow(ones(Nh)./(Nh))))
+        stream_filter = StreamFilter(dio.frame_length, fir_filter)
+
+        return new(stream_filter, dio, mfcc_filter_bank, dio.frame_length, hop_size, size(mfcc_filter_bank)[1]+2)
     end
 end
 
@@ -45,7 +54,8 @@ unzip(a) = map(x->getfield.(a, x), fieldnames(eltype(a)))
 function (fs::FeatureScanner)((xs, (previous_f0s,))::Tuple{<:AbstractMatrix, Tuple{Vector{F0Estimate}}}, ps, st::NamedTuple)
     ys, f0s = [
         begin
-            f0 = fs.dio(Vector(x); previous_estimate = f0)
+            x = x[1:fs.hop_size] |> Vector |> fs.stream_filter
+            f0 = fs.dio(x; previous_estimate = f0)
             spectrogram = DSP.periodogram(x; fs = fs.dio.sample_rate, window=blackman)
             mc = mfcc(spectrogram; filter_bank = fs.mfcc_filter_bank)
 
@@ -80,7 +90,7 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:feature_scanner, :co
         speaker = true
     )
         # analyzers to get MFCC, F0, aperiodicity, etc
-        feature_scanner = FeatureScanner()
+        feature_scanner = FeatureScanner(output_n)
 
         # input should contain enough samples to satisfy the analyzers' requirements
         # output has the same length as input

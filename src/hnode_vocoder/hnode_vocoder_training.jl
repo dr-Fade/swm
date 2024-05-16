@@ -4,8 +4,9 @@ include("../sound_utils/sound_file_utils.jl")
 
 using FLAC, FileIO, BSON, Dates, WAV, Plots, Distributed
 
-function get_training_data(model::hNODEVocoder, sound, sample_rate; output=nothing)
+function get_training_data(model::hNODEVocoder, sound, sample_rate; added_noise_level=0f0)
     sound = resample(sound, Float32(FEATURE_EXTRACTION_SAMPLE_RATE / sample_rate); dims = 1) |> Vector{Float32}
+    sound_with_noise = sound + added_noise_level * (2 * rand(Float32, length(sound)) .- 1)
 
     frame_size = model.input_n
     hop_size = model.output_n
@@ -21,11 +22,17 @@ function get_training_data(model::hNODEVocoder, sound, sample_rate; output=nothi
         frame = sound[i:i+frame_size-1]
         push!(aggregated_sound, frame)
 
-        features, st = feature_scanner([frame;;], ps, st)
+        frame_with_noise = sound_with_noise[i:i+frame_size-1]
+        features, st = feature_scanner([frame_with_noise;;], ps, st)
         push!(aggregated_features, features[:])
     end
 
     return hcat(aggregated_sound...), hcat(aggregated_features...)
+end
+
+function get_denoising_training_data(model::hNODEVocoder; noise_length=FEATURE_EXTRACTION_SAMPLE_RATE, max_noise_level=0.001f0)
+    sound = zeros(Float32, noise_length)
+    return get_training_data(model, sound, model.sample_rate; added_noise_level=max_noise_level)
 end
 
 function get_connected_trajectory(model, ps, st, data)
