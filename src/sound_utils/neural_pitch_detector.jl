@@ -2,6 +2,7 @@ using Lux, Random, DSP, FFTW, Statistics
 
 include("stream_filter.jl")
 include("mel.jl")
+include("../nn/activation_functions.jl")
 
 PITCH_DETECTION_SAMPLE_RATE::Int = 4000
 
@@ -24,67 +25,29 @@ conv_1d(n, k; depth=1) = Lux.Chain(
     Lux.FlattenLayer(),
 ), conv_1d_output_dims(n,k;depth=depth)
 
-struct NeuralPitchDetector <: Lux.AbstractExplicitLayer
-    time_domain_n::Int
-    padded_sound_n::Int
-    spectrogram_n::Int
-    cepstrum_n::Int
-    min_quefrency_i::Int
-    max_quefrency_i::Int
-
-    hidden_output_n::Int
-
-    window::Vector{Float32}
-
-    stream_filter::Lux.StatefulRecurrentCell
-    time_domain_estimator::Lux.AbstractExplicitLayer
-    frequency_domain_estimator::Lux.AbstractExplicitLayer
-    quefrency_domain_estimator::Lux.AbstractExplicitLayer
-
+struct NeuralPitchDetector <: Lux.AbstractExplicitContainerLayer{(:memory, :estimator)}
+    fir_filter::FIRFilter
+    memory::Lux.AbstractRecurrentCell
+    estimator::Lux.AbstractExplicitLayer
     sample_rate::Float32
 
     function NeuralPitchDetector(sample_rate::Int)
-        time_domain_n = 3*PITCH_DETECTION_SAMPLE_RATE ÷ F0_FLOOR |> Int
-        padded_sound_n = PITCH_DETECTION_SAMPLE_RATE |> nextfastfft
-        frequency_domain_n = (zeros(Float32, padded_sound_n) |> rfft |> length)
-
-        quefrencies = rfftfreq(frequency_domain_n, 1)
-        min_quefrency_i = findfirst(q -> q ≥ 1/F0_CEIL, quefrencies)
-        max_quefrency_i = length(quefrencies)
-
-        quefrency_domain_n = max_quefrency_i - min_quefrency_i + 1
-        hidden_output_n = 32
-
         filter_window_width = 2*(sample_rate / F0_CEIL) |> floor |> Int
         filter_window = blackman(filter_window_width) |> Vector{Float32} |> FIRWindow
         h = digitalfilter(DSP.Lowpass(2*F0_CEIL; fs=sample_rate), filter_window) |> Vector{Float32}
-        stream_filter = StreamFilter(time_domain_n, FIRFilter(h, PITCH_DETECTION_SAMPLE_RATE // sample_rate))
+        fir_filter = FIRFilter(h, PITCH_DETECTION_SAMPLE_RATE // sample_rate)
 
-        spectrogram_window = blackman(time_domain_n) |> Vector{Float32}
-
-        time_domain_estimator = Lux.Chain(
-            Lux.ReshapeLayer((1, time_domain_n)),
-            Lux.RNNCell(1 => hidden_output_n) |> Recurrence,
-            Lux.Dense(hidden_output_n, hidden_output_n, tanh)
-        )
-
-        conv, conv_dims = conv_1d(frequency_domain_n, Int(F0_CEIL); depth=2)
-        frequency_domain_estimator = Lux.Chain(
-            conv,
-            Lux.Dense(conv_dims, conv_dims, tanh),
-            Lux.Dense(conv_dims, hidden_output_n, tanh)
-        )
-
-        quefrency_domain_estimator = Lux.Chain(
-            Lux.Dense(quefrency_domain_n, quefrency_domain_n, tanh),
-            Lux.Dense(quefrency_domain_n, hidden_output_n, tanh)
+        memory_n = 256
+        memory = Lux.RNNCell(1 => memory_n; init_state=rand32)
+        estimator = Lux.Chain(
+            Lux.Dense(memory_n, memory_n, tanh),
+            Lux.Dense(memory_n, 1, σ)
         )
 
         return new(
-            time_domain_n, padded_sound_n, frequency_domain_n, quefrency_domain_n, min_quefrency_i, max_quefrency_i, hidden_output_n,
-            spectrogram_window,
-            stream_filter |> Lux.StatefulRecurrentCell,
-            time_domain_estimator, frequency_domain_estimator, quefrency_domain_estimator,
+            fir_filter,
+            memory,
+            estimator,
             sample_rate
         )
     end
@@ -92,43 +55,28 @@ struct NeuralPitchDetector <: Lux.AbstractExplicitLayer
 end
 
 Lux.initialparameters(rng::AbstractRNG, npd::NeuralPitchDetector) = (
-    Wt = rand32(rng, 1, npd.hidden_output_n),
-    Wf = rand32(rng, 1, npd.hidden_output_n),
-    Wq = rand32(rng, 1, npd.hidden_output_n),
-    b = rand32(rng, 1),
-    stream_filter=Lux.initialparameters(rng, npd.time_domain_estimator),
-    time_domain_estimator=Lux.initialparameters(rng, npd.time_domain_estimator),
-    frequency_domain_estimator=Lux.initialparameters(rng, npd.frequency_domain_estimator),
-    quefrency_domain_estimator=Lux.initialparameters(rng, npd.quefrency_domain_estimator)
+    memory=Lux.initialparameters(rng, npd.memory),
+    estimator=Lux.initialparameters(rng, npd.estimator),
 )
 
 Lux.initialstates(rng::AbstractRNG, npd::NeuralPitchDetector) = (
-    stream_filter=Lux.initialstates(rng, npd.time_domain_estimator),
-    time_domain_estimator=Lux.initialstates(rng, npd.time_domain_estimator),
-    frequency_domain_estimator=Lux.initialstates(rng, npd.frequency_domain_estimator),
-    quefrency_domain_estimator=Lux.initialstates(rng, npd.quefrency_domain_estimator)
+    memory=Lux.initialstates(rng, npd.memory),
+    estimator=Lux.initialstates(rng, npd.estimator),
 )
 
-function (npd::NeuralPitchDetector)(sound::AbstractMatrix, ps, st)
-    filtered_sound, stream_filter_st = npd.stream_filter(sound, ps.stream_filter, st.stream_filter)
-    padded_sound = vcat(filtered_sound .* npd.window, zeros(Float32, npd.padded_sound_n - npd.time_domain_n, size(filtered_sound)[2]))
-    spectrogram = (
-        s = log10.(abs.(rfft(padded_sound .- mean.(eachcol(padded_sound))', 1)) .+ eps(Float32));
-        s .- mean.(eachcol(s))'
-    )
-    cepstrum = (
-        c = log10.(abs.(rfft(spectrogram, 1)[model.min_quefrency_i:model.max_quefrency_i,:]) .+ eps());
-        c .- mean.(eachcol(c))'
-    )
-    return npd((filtered_sound, spectrogram, cepstrum), ps, (st..., stream_filter = stream_filter_st))
+function (npd::NeuralPitchDetector)(samples, ps, st)
+    reset!(npd.fir_filter)
+    return npd((samples, zeros32(1, size(samples)[end])), ps, st)
 end
 
-function (npd::NeuralPitchDetector)((sound, spectrogram, cepstrum), ps, st)
-    t, _ = npd.time_domain_estimator(sound, ps.time_domain_estimator, st.time_domain_estimator)
-    f, _ = npd.frequency_domain_estimator(spectrogram, ps.frequency_domain_estimator, st.frequency_domain_estimator)
-    q, _ = npd.quefrency_domain_estimator(cepstrum, ps.quefrency_domain_estimator, st.quefrency_domain_estimator)
-
-    f0 = σ(ps.Wt*t + ps.Wf*f + ps.Wq*q .+ ps.b) .|> denormalize_pitch
-
-    return f0, st
+function (npd::NeuralPitchDetector)((samples, prev_f0)::Tuple, ps, st)
+    decimated_samples = npd.sample_rate == PITCH_DETECTION_SAMPLE_RATE ? samples : DSP.filt(npd.fir_filter, samples)
+    return if length(decimated_samples) > 0
+        rnn_sequence = reshape(decimated_samples, 1, size(decimated_samples)...)
+        memory_value, memory_st = Recurrence(npd.memory)(rnn_sequence, ps.memory, st.memory)
+        f0s, estimator_st = npd.estimator(memory_value, ps.estimator, st.estimator)
+        denormalize_pitch.(f0s), (st..., memory = memory_st, estimator = estimator_st)
+    else
+        prev_f0
+    end
 end
