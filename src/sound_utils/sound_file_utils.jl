@@ -27,7 +27,7 @@ function load_sounds(target_dirs...; file_limit_per_dir = nothing, verbose = tru
                     if endswith(f, "flac") || endswith(f, "wav")
                         sound, sample_rate = load(f)
                         if sample_rate != target_sample_rate
-                            sound = resample(sound[:,1], target_sample_rate / sample_rate) 
+                            sound = resample(sound[:,1], target_sample_rate / sample_rate)
                         end
                         sound = sound[:,1]
                         sound[1:fade_duration] .*= fade_in
@@ -37,7 +37,7 @@ function load_sounds(target_dirs...; file_limit_per_dir = nothing, verbose = tru
                         Vector{Float32}()
                     end
                 end
-                for f ∈ files[1:(isnothing(file_limit_per_dir) ? end : file_limit_per_dir)]
+                for f ∈ files[1:(isnothing(file_limit_per_dir) ? end : min(file_limit_per_dir, length(files)))]
             ]
         end
         for target_dir ∈ vcat(get_dirs_with_sound.(target_dirs)...)
@@ -46,7 +46,7 @@ function load_sounds(target_dirs...; file_limit_per_dir = nothing, verbose = tru
     return result
 end
 
-function create_synthesized_data(N, f0_floor, f0_ceil, sample_rate; harmonics = 1, output_dir="synthesized_data", max_peak=1.0, f_step=10, noise = max_peak * 0.01)
+function create_synthesized_data(N, f0_floor, f0_ceil, sample_rate; harmonics = 1, output_dir="synthesized_data", max_peak=1.0, f_step=10, noise = 0f0)
     sine_wave = (f0, A, ϕ) -> x -> Float32(A*sin(f0 * 2π * x + ϕ))
 
     if !isdir(output_dir)

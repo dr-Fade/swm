@@ -1,4 +1,4 @@
-using Optimisers, Zygote, Lux, MLUtils, ADTypes
+using Optimisers, Zygote, Lux, MLUtils, ADTypes, Setfield
 
 unixepoch() = datetime2unix(now()) |> round |> Int
 
@@ -41,15 +41,15 @@ function init_training_state(model, ps, st, optimiser, distributed_backend=nothi
     rng = Random.default_rng()
     tstate = Lux.Training.TrainState(rng, model, isnothing(distributed_backend) ? optimiser : DistributedUtils.DistributedOptimizer(distributed_backend, optimiser))
     if !isnothing(ps)
-        Lux.@set! tstate.parameters = ps
+        Setfield.@set! tstate.parameters = ps
     end
     if !isnothing(st)
-        Lux.@set! tstate.states = st
+        Setfield.@set! tstate.states = st
     end
     if !isnothing(distributed_backend)
-        Lux.@set! tstate.parameters = DistributedUtils.synchronize!!(distributed_backend, tstate.parameters)
-        Lux.@set! tstate.states = DistributedUtils.synchronize!!(distributed_backend, tstate.states)
-        Lux.@set! tstate.optimizer_state = DistributedUtils.synchronize!!(distributed_backend, tstate.optimizer_state)
+        Setfield.@set! tstate.parameters = DistributedUtils.synchronize!!(distributed_backend, tstate.parameters)
+        Setfield.@set! tstate.states = DistributedUtils.synchronize!!(distributed_backend, tstate.states)
+        Setfield.@set! tstate.optimizer_state = DistributedUtils.synchronize!!(distributed_backend, tstate.optimizer_state)
     end
     return tstate
 end
@@ -78,7 +78,7 @@ function train(
                 tstate = Lux.Experimental.apply_gradients(tstate, grads)
             finally
                 for state in states_to_clear
-                    Lux.@set! tstate.states = Lux.update_state(tstate.states, state, nothing)
+                    Setfield.@set! tstate.states = Lux.update_state(tstate.states, state, nothing)
                 end
             end
             if !isnothing(batch_cb)

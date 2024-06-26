@@ -1,39 +1,38 @@
 using LinearAlgebra, SignalAnalysis, DSP
 
-const F0Estimate = @NamedTuple{value::Float32, confidence::Float32, loudness::Float32}
+const F0Estimate = @NamedTuple{value::Float32, confidence::Float32}
 
 struct DIO
     f0_ceil::Float32
     f0_floor::Float32
     sample_rate::Integer
-    decimation_rate::Float32
-    frame_length::Int
-    lowpass_filters::Vector{Vector{Float32}}
-    resample_filter::Vector{Float32}
+    decimated_frame_length::Int
+    filters::Vector{FIRFilter}
+    buffers::Vector{Vector{Float32}}
     τ_min::Int
     τ_max::Int
     relative_peak_threshold::Float32
     noise_floor::Float32
-    DIO(f0_ceil, f0_floor, sample_rate; relative_peak_threshold = 0.5, noise_floor = 0.01) = begin
-        frame_length = (3sample_rate / f0_floor) |> round |> Int
-        window_width = 2 * DOWNSAMPLED_RATE / f0_ceil |> floor |> Int
-        window = window_width |> round |> Int |> hanning |> FIRWindow
+
+    DIO(f0_ceil, f0_floor, sample_rate; relative_peak_threshold = 0.25, noise_floor = 0.01) = begin
+        decimated_frame_length = (3 * DOWNSAMPLED_RATE / f0_floor) |> round |> Int
+        window_width = (sample_rate / f0_floor) |> floor |> Int
+        window = DSP.Windows.tukey(window_width, 0.5) |> Vector{Float32} |> FIRWindow
+        bands = Int.(exp2.(round(log2(f0_floor)):round(log2(f0_ceil)))[1:end])
         filters = [
             begin
-                cutoff = f0_ceil / 2^band
-                lowpass = Lowpass(cutoff; fs=DOWNSAMPLED_RATE)
-                digitalfilter(lowpass, window)
+                h = digitalfilter(DSP.Bandpass(f0_floor, band; fs=sample_rate), window) |> Vector{Float32}
+                FIRFilter(h, DOWNSAMPLED_RATE // sample_rate)
             end
-            for band ∈ 0:log2(2 * f0_ceil / f0_floor) .|> Int32
+            for band ∈ bands
         ]
         new(
             f0_ceil,
             f0_floor,
             sample_rate,
-            DOWNSAMPLED_RATE / sample_rate,
-            frame_length,
+            decimated_frame_length,
             filters,
-            resample_filter(DOWNSAMPLED_RATE / sample_rate),
+            [zeros(Float32, decimated_frame_length) for i ∈ 1:length(bands)],
             DOWNSAMPLED_RATE / 3 / f0_ceil |> round |> Int,
             DOWNSAMPLED_RATE / 3 / f0_floor |> round |> Int,
             relative_peak_threshold,
@@ -42,23 +41,12 @@ struct DIO
     end
 end
 
-# wrapper over DSP.resample to allow currying for composability
-decimate(dio::DIO) = sample -> 
-    resample(sample, dio.decimation_rate, dio.resample_filter)
-
-# wrapper over SignalAnalysis.removedc to allow currying for composability
-remove_dc() = sample ->
-    removedc(sample; α=0.95f0)
-
-# run through the sample with the RMA filter to attenuate harmonics
+# decimate the signal and apply different filters to attenuate different harmonics
 attenuate_harmonics(dio::DIO) = sample -> begin
-    y = sample
-    res = Vector{Vector{Float32}}()
-    for filter ∈ dio.lowpass_filters
-        y = filt(filter, y |> reverse) |> reverse
-        res = [res; [y]]
+    for ((i, f), buf) ∈ zip(enumerate(dio.filters), dio.buffers)
+        shiftin!(buf, DSP.filt(f, sample) * log2(i+1f0))
     end
-    res |> reverse
+    dio.buffers
 end
 
 const Point2d = Tuple{Float32, Float32}
@@ -202,7 +190,7 @@ end
 detect_pitch(dio::DIO) = sample::Vector{Float32} -> begin
     rms_sample = rms(sample)
     if rms_sample < dio.noise_floor
-        return (value=0f0, confidence=0f0, loudness=0f0)
+        return (value=0f0, confidence=0f0)
     end
 
     noise_floor = max(rms_sample / 4, dio.noise_floor)
@@ -218,73 +206,34 @@ detect_pitch(dio::DIO) = sample::Vector{Float32} -> begin
         f0 = 1 / T
     end
 
-    (value=f0, confidence=Λ, loudness=0f0)
+    (value=f0, confidence=Λ)
 end
 
 # find the f0 estimation with the highest likelihood value λ and lowest distance from the previous estimate
-select_candidate(previous_estimate::F0Estimate = (value=0f0, confidence=0f0, loudness=0f0), loudness = 0f0; threshold = 0.75f0) = estimates::Vector{F0Estimate} -> begin
-    valid_estimates = filter(estimate -> estimate.confidence > threshold, estimates)
-    return if isempty(valid_estimates)
-        (value=0f0, confidence=0f0, loudness=loudness)
-    else
-        _, idx = findmin(estimate -> abs(estimate.value - previous_estimate.value) / estimate.confidence, valid_estimates)
-        valid_estimates[idx]
-    end
-end
-
-fix_candidate(
-    previous_estimate::F0Estimate = (value=0f0, confidence=0f0, loudness=0f0),
-    loudness = 0f0,
-    noise_floor = 0.01f0,
-    frequency_change_tolerance = 0.5f0
-) = estimate::F0Estimate -> begin
-    if estimate.confidence < previous_estimate.confidence && loudness > noise_floor
-        max_f0 = max(previous_estimate.value, estimate.value)
-        min_f0 = max(min(previous_estimate.value, estimate.value), 1f0)
-        max_loudness = max(previous_estimate.loudness, loudness)
-        min_loudness = max(min(previous_estimate.loudness, loudness), noise_floor)
-
-        f0_change_rate = round(max_f0 / min_f0; digits = 2)
-        loudness_change_rate = round(max_loudness / min_loudness; digits = 2)
-        if f0_change_rate > loudness_change_rate
-            estimate = previous_estimate
-        end
-    elseif previous_estimate.value > 0 && 1 - frequency_change_tolerance ≤ log2(max(estimate.value / previous_estimate.value, 1f0))
-        estimate = previous_estimate
+select_candidate(previous_estimate::F0Estimate = (value=0f0, confidence=0f0)) = estimates::Vector{F0Estimate} -> begin
+    if isempty(estimates)
+        return (value=0f0, confidence=0f0)
     end
 
-    return (estimate..., loudness = loudness)
+    _, i = findmax(e -> e.confidence, estimates)
+    candidate = estimates[i]
+
+    if candidate.confidence < previous_estimate.confidence
+        _, j = findmin(e -> abs(e.value - previous_estimate.value), estimates)
+        candidate = (value = estimates[j].value, confidence = candidate.confidence)
+    end
+    
+    return candidate
 end
 
-const DOWNSAMPLED_RATE = 4000f0
+const DOWNSAMPLED_RATE::Int = 4000
 
 # the algorithm is lifted straight from the article:
 # https://www.isca-speech.org/archive/pdfs/interspeech_2016/daido16_interspeech.pdf
-(dio::DIO)(sample::Vector{Float32}; previous_estimate::F0Estimate = (value=0f0, confidence=0f0, loudness=0f0)) = sample |>
-    decimate(dio) |>
-    remove_dc() |>
+(dio::DIO)(sample::Vector{Float32}; previous_estimate::F0Estimate = (value=0f0, confidence=0f0)) = sample |>
     attenuate_harmonics(dio) .|>
     detect_pitch(dio) |>
-    select_candidate(previous_estimate) |>
-    fix_candidate(previous_estimate, rms(sample))
-
-parallel_pitch_detection(dio::DIO, hop::Float32) = sound::Vector{Float32} -> begin
-    hop_size = (hop * (DOWNSAMPLED_RATE / 1000)) |> round |> Int
-    frame_size = dio.frame_length * dio.decimation_rate |> floor |> Int
-    [
-        begin
-            sound[
-                if i+frame_size < length(sound)
-                    i:i+frame_size
-                else
-                    i:-1:i-frame_size
-                end
-            ] |>
-            detect_pitch(dio)
-        end
-        for i ∈ 1:hop_size:length(sound)
-    ]
-end
+    select_candidate(previous_estimate)
 
 select_candidates(estimates::Vector{Vector{F0Estimate}}) = begin
     N = estimates[1] |> length
@@ -301,9 +250,14 @@ select_candidates(estimates::Vector{Vector{F0Estimate}}) = begin
 end
 
 # return an estimated f0 curve and time axis at which the values were detected
-dio_contour(dio::DIO, sound::Vector{Float32}; hop::Float32 = 1.0)::Vector{Tuple{Float32, Float32}} = sound |>
-    decimate(dio) |>
-    remove_dc(DC_THRESHOLD) |>
-    attenuate_harmonics(dio) .|>
-    parallel_pitch_detection(dio, hop) |>
-    select_candidates
+dio_contour(dio::DIO, sound::Vector{Float32}; hop::Float32 = 1f0)::Vector{F0Estimate} = begin
+    N = length(sound)
+    n = hop * dio.sample_rate / 1000f0 |> round |> Int
+    res = [(value=0f0, confidence=0f0)]
+    for frame ∈ eachcol(reshape(sound[1:end-N%n], n, N÷n))
+        estimate = dio(Vector(frame); previous_estimate = res[end])
+        push!(res, estimate)
+    end
+    return res
+end
+    

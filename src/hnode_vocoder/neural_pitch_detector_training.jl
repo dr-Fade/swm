@@ -8,9 +8,9 @@ sine_wave = (f0, A, ϕ) -> x -> Float32(A*sin(f0 * 2π * x + ϕ))
 function get_training_data(model::NeuralPitchDetector, f0::Float32, A::Float32, ϕ::Float32; harmonics=1, β::Float32=0f0, N=nothing, window=ones32)
     N = isnothing(N) ? floor(model.sample_rate / f0) |> Int : N
 
-    range = (0:N-1) ./ model.sample_rate
+    range = (0:2*Int(model.sample_rate * N / PITCH_DETECTION_SAMPLE_RATE)) ./ model.sample_rate
     ϕ = f0 == 0f0 ? 0f0 : ϕ
-    noise = 2*rand32(Random.default_rng(), N).-1f0
+    noise = 2*rand32(Random.default_rng(), length(range)).-1f0
 
     res = sum([
         sine_wave(harmonic*f0, if harmonic == 1 1f0 else 2*rand(Float32)/harmonic end, ϕ).(range)
@@ -18,7 +18,8 @@ function get_training_data(model::NeuralPitchDetector, f0::Float32, A::Float32, 
     ])
     res ./= max(maximum(res), 1)
     res .*= A
-    sound = (1-β)*res + β*noise
+    reset!(model.fir_filter)
+    sound = DSP.filt(model.fir_filter, (1-β)*res + β*noise)[end-N+1:end]
 
     return [sound .* (window(length(sound)) |> Vector{Float32});;]
 end
@@ -27,22 +28,17 @@ function create_synthesized_training_data(model::NeuralPitchDetector, f0s::Vecto
     N = isnothing(N) ? floor(sample_rate / minimum(f0s)) |> Int : N
 
     input_frames = Vector{Matrix{Float32}}()
-    target_f0s = Vector{Float32}()
+    target_f0s = Vector{Vector{Float32}}()
     for (f0, A, ϕ) ∈ zip(f0s, As, ϕs)
         frames = get_training_data(model, f0, A, ϕ; harmonics=harmonics, β=β, N=N, window=window)
         push!(input_frames, frames)
-        push!(target_f0s, f0)
+        push!(target_f0s, repeat([f0], size(frames)[1]))
     end
 
     input_frames = hcat(input_frames...)
-    target_f0s = target_f0s'
+    target_f0s = hcat(target_f0s...)
 
     return input_frames, target_f0s
-
-    # return (filtered_sounds .- filtered_sound_means) ./ filtered_sound_stds,
-    #     (spectrogram .- spectrogram_means) ./ spectrogram_stds,
-    #     (cepstrum .- cepstrum_means) ./ cepstrum_stds,
-    #     target_f0s
 end
 
 function concat_training_data(xs, ys, fade_duration=size(xs)[1]÷3)
@@ -70,16 +66,8 @@ function concat_training_data(xs, ys, fade_duration=size(xs)[1]÷3)
     return xs, ys
 end
 
-function estimate_f0(model, ps, st, signal)
-    pred_ys = zeros32(1, size(signal)[2])
-    for s ∈ eachslice(reshape(signal, 1, size(signal)...); dims=2)
-        pred_ys, st = model(s, ps, st)
-    end
-    return denormalize_pitch.(pred_ys)
-end
-
 function train_pitch_detector(
-    model::Lux.AbstractExplicitLayer, ps, st::NamedTuple, training_data;
+    model::NeuralPitchDetector, ps, st::NamedTuple, training_data;
     batchsize = 1, epochs = 1, epoch_cb = nothing, batch_cb = nothing, optimiser = Optimisers.Adam(), distributed_backend = nothing
 )
 
@@ -90,9 +78,11 @@ function train_pitch_detector(
 
         loss = 0f0
 
-        for memory_value ∈ Recurrence(model.memory; return_sequence=true)(reshape(xs, 1, size(xs)...), ps.memory, st.memory)[1]
-            pred_ys = model.estimator(memory_value, ps.estimator, st.estimator)[1] .|> denormalize_pitch
-            loss += sum(abs2, ys .- pred_ys)
+        N, batch_n = size(xs)
+        sequence = reshape(xs[1:end-N%model.decimated_input_n,:], model.decimated_input_n, N÷model.decimated_input_n, batch_n)
+        for (memory_value, y) ∈ zip(Recurrence(model.memory; return_sequence=true)(sequence, ps.memory, st.memory)[1], eachrow(ys))
+            pred_y = model.estimator(memory_value, ps.estimator, st.estimator)[1] .|> denormalize_pitch
+            loss += sum(abs2, y' - pred_y)
         end
 
         regularization = sum(abs, ComponentArray(ps)) / length(ComponentArray(ps))
@@ -103,4 +93,30 @@ function train_pitch_detector(
         model, loader, loss_function;
         ps = ps, st = st, epochs = epochs, optimiser = optimiser, epoch_cb = epoch_cb, batch_cb = batch_cb, distributed_backend = distributed_backend
     )
+end
+
+function pitch_detector_training_routine(model, ps, st)
+    train_filtered_sounds = Vector{Matrix{Float32}}()
+    train_f0s = Vector{Matrix{Float32}}()
+
+    for i in shuffle(1:10)
+        s, f = create_synthesized_training_data(
+            model,
+            vcat(zeros32(zeros_n), collect(range(1, F0_CEIL, n))),
+            0.1f0 .+ 0.7f0*rand32(Random.default_rng(), n+zeros_n),
+            10*rand32(Random.default_rng(), n+zeros_n);
+            harmonics=i,
+            β=0.01f0,
+            N=256
+        )
+
+        push!(train_filtered_sounds, s)
+        push!(train_f0s, f)
+    end
+    train_filtered_sounds = hcat(train_filtered_sounds...)
+    train_f0s = hcat(train_f0s...)
+
+    data =  (train_filtered_sounds, train_f0s)
+
+    return train_pitch_detector(model, ps, st, data; batchsize = 128, epochs = 1, optimiser = Optimisers.Adam(0.0001))
 end

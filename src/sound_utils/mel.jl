@@ -1,5 +1,7 @@
 using DSP, FFTW
 
+MEL_HZ_INTERSECTION::Float32 = 1000f0
+
 hz_to_mel(hz) = 2595 * log10(1 + hz / 700)
 mel_to_hz(mel) = 700 * (10 ^ (mel / 2595) - 1)
 
@@ -23,6 +25,6 @@ function get_mel_filter_banks(freqs::Vector{Float32}; k = 30)
     return filters
 end
 
-function mfcc(periodogram::DSP.Periodograms.Periodogram; k=30, filter_bank = get_mel_filter_banks(periodogram.freq; k=k))
-    return dct(filter_bank * log10.(periodogram.power .+ eps()))[2:end]
+function mfcc(periodogram::Vector{Float32}; k=30, filter_bank = get_mel_filter_banks(periodogram.freq; k=k))
+    return log10.(abs.(dct(filter_bank * (periodogram .- mean(periodogram)))[2:end]))
 end

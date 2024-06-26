@@ -4,40 +4,55 @@ include("../sound_utils/sound_file_utils.jl")
 
 using FLAC, FileIO, BSON, Dates, WAV, Plots, Distributed
 
-function get_training_data(model::hNODEVocoder, sound, sample_rate; added_noise_level=0f0)
-    sound = resample(sound, Float32(FEATURE_EXTRACTION_SAMPLE_RATE / sample_rate); dims = 1) |> Vector{Float32}
-    sound_with_noise = sound + added_noise_level * (2 * rand(Float32, length(sound)) .- 1)
-
-    frame_size = model.input_n
-    hop_size = model.output_n
+function get_training_data(model::hNODEVocoder, sound; β=0f0, drop_mfccs=false)
+    frame_size = model.n
 
     feature_scanner = model.feature_scanner
-    rng = Random.default_rng()
-    ps, st = Lux.setup(rng, feature_scanner)
+    stream_filter = model.stream_filter
 
-    aggregated_sound = Vector{Vector{Float32}}()
+    rng = Random.default_rng()
+    stream_filter_ps, stream_filter_st = Lux.setup(rng, stream_filter)
+    target_stream_filter_st = deepcopy(stream_filter_st)
+    feature_scanner_ps, feature_scanner_st = Lux.setup(rng, feature_scanner)
+
+    aggregated_input_sound = Vector{Vector{Float32}}()
+    aggregated_target_sound = Vector{Vector{Float32}}()
     aggregated_features = Vector{Vector{Float32}}()
 
-    for i ∈ 1:hop_size:length(sound)-frame_size
+    for i ∈ 1:frame_size:length(sound)-frame_size
         frame = sound[i:i+frame_size-1]
-        push!(aggregated_sound, frame)
+        frame_with_noise = (1-β)*frame + β*randn(Float32, length(frame))
 
-        frame_with_noise = sound_with_noise[i:i+frame_size-1]
-        features, st = feature_scanner([frame_with_noise;;], ps, st)
+        filtered_frame, target_stream_filter_st = stream_filter(frame, stream_filter_ps, target_stream_filter_st)
+        filtered_frame_with_noise, stream_filter_st = stream_filter(frame_with_noise, stream_filter_ps, stream_filter_st)
+        features, feature_scanner_st = feature_scanner([filtered_frame;;], feature_scanner_ps, feature_scanner_st)
+
+        if drop_mfccs
+            features[4:end,:] = 3*(rand32(Random.default_rng(), MFCC_SIZE) .- 0.5)
+        end
+
+        push!(aggregated_input_sound, filtered_frame_with_noise[:])
+        push!(aggregated_target_sound, frame[:])
         push!(aggregated_features, features[:])
     end
 
-    return hcat(aggregated_sound...), hcat(aggregated_features...)
+    return (
+        input=hcat(aggregated_input_sound...),
+        target=hcat(aggregated_target_sound...),
+        features=hcat(aggregated_features...)
+    )
 end
 
 function get_denoising_training_data(model::hNODEVocoder; noise_length=FEATURE_EXTRACTION_SAMPLE_RATE, max_noise_level=0.001f0)
     sound = zeros(Float32, noise_length)
-    return get_training_data(model, sound, model.sample_rate; added_noise_level=max_noise_level)
+    training_data = get_training_data(model, sound; β=max_noise_level)
+    return (training_data..., target=zeros(Float32, size(training_data[1])))
 end
 
 function get_connected_trajectory(model, ps, st, data)
     frames, features = data
-    output_n = model.output_n
+
+    output_n = model.n
     Δt = LATENT_SPACE_SAMPLE_RATE_SCALER / model.sample_rate
     T = output_n * Δt
 
@@ -72,47 +87,53 @@ function train_final_model(
     model::hNODEVocoder, ps, st::NamedTuple, training_data;
     batchsize = 1, slices = 1, epochs = 1, epoch_cb = nothing, batch_cb = nothing, optimiser = Optimisers.Adam(), distributed_backend = nothing
 )
-    output_n = model.output_n
+    output_n = model.n
 
     st = (st..., resampled = true)
 
-    frames, features = training_data
+    frames = training_data.input
+    target = training_data.target
+    features = training_data.features
     N = size(frames)[2]
     #data
     data = (
         reshape(frames[:,1:end-N%slices], size(frames)[1], slices, N÷slices),
+        reshape(target[:,1:end-N%slices], size(target)[1], slices, N÷slices),
         reshape(features[:,1:end-N%slices], size(features)[1], slices, N÷slices)
     )
     loader = DataLoader(data; batchsize = batchsize, shuffle=true)
 
-    window = blackman(model.output_n*slices)
+    window = blackman(output_n*slices)
     #training
     function loss_function(model, ps, st, data)
-        frames, features = data
+        input, target, features = data
 
-        u0s = model.encoder(frames[:,1,:], ps.encoder, st.encoder)[1]
+        u0s = model.encoder(input[:,1,:], ps.encoder, st.encoder)[1]
 
-        target_sound = vcat(eachslice(frames[1:output_n,:,:]; dims = 2)...)
+        target_sound = vcat(eachslice(target[1:output_n,:,:]; dims = 2)...)
         generated_sound = Matrix{Float32}(undef, 0, size(target_sound)[2])
 
         regularization_loss = 0f0
-        for (frames_slice, features_slice) ∈ zip(eachslice(frames; dims = 2), eachslice(features; dims = 2))
-            (pred_ys, (u0s,)), st = model((frames_slice, (u0s, features_slice)), ps, st)
+        for (input_slice, features_slice) ∈ zip(eachslice(input; dims = 2), eachslice(features; dims = 2))
+            (pred_ys, (u0s,)), st = model((input_slice, (u0s, features_slice)), ps, st)
             generated_sound = vcat(generated_sound, pred_ys)
             regularization_loss += sum(abs, model.control(features_slice, ps.control, st.control)[1])
         end
         regularization_loss /= Lux.parameterlength(model.ode)
+        regularization_loss += sum(abs, ComponentArray(ps.encoder)) / length(ComponentArray(ps.encoder))
+                            + sum(abs, ComponentArray(ps.control)) / length(ComponentArray(ps.control))
+                            + sum(abs, ComponentArray(ps.decoder)) / length(ComponentArray(ps.decoder))
+                            + 100*sum(abs, ps.control.feature_filter.Wh)
+                            + 100*sum(exp, real.(eigvals(ps.control.feature_filter.Wh)))
 
         raw_loss = sum(abs2, 100*(generated_sound .- target_sound)) / slices
 
-        spectral_loss = if length(generated_sound) ≥ 512
-            generated_fft = log10.((abs2.(fft(generated_sound .* window, 1)[1:end÷2,:]) .+ eps()))
-            target_fft = log10.((abs2.(fft(target_sound .* window, 1)[1:end÷2,:]) .+ eps()))
-
-            sum(abs2, generated_fft .- target_fft)
-        else
-            0f0
+        spectral_loss = begin
+            generated_fft = fft(generated_sound .* window, 1)
+            target_fft = fft(target_sound .* window, 1)
+            sum(abs2, 100*(abs.(generated_fft) - abs.(target_fft)))
         end
+
         return (regularization_loss + raw_loss + spectral_loss) / batchsize, st, (nothing,)
     end
 
