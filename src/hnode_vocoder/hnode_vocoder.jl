@@ -22,14 +22,13 @@ denormalize_pitch(normalized_f0) = mel_to_hz(normalized_f0 * F0_CEIL_MEL)
 
 # the ode trajectories may evolve much slower than the actual time domain signal
 # we need to scale the integration step so that it's larger than the Δt between signal samples
-const LATENT_SPACE_SAMPLE_RATE_SCALER::Float32 = 1000
+const LATENT_SPACE_SAMPLE_RATE_SCALER::Float32 = 2000
 
 const MFCC_SIZE::Int = 29
 
 # the scanner is a recurrent network because DIO requires f0 info from the previous frame
 struct FeatureScanner <: Lux.AbstractRecurrentCell{false, false}
     dio::DIO
-    cheaptrick::CheapTrick
     mfcc_filter_bank::Matrix{Float32}
     input_n::Int
     hop_size::Int
@@ -37,18 +36,14 @@ struct FeatureScanner <: Lux.AbstractRecurrentCell{false, false}
 
     function FeatureScanner(hop_size::Int)
         dio = DIO(F0_CEIL, F0_FLOOR, FEATURE_EXTRACTION_SAMPLE_RATE; noise_floor = 0.02)
-        cheaptrick = CheapTrick(F0_CEIL, F0_FLOOR, FEATURE_EXTRACTION_SAMPLE_RATE)
 
-        input_n = max(
-            dio.decimated_frame_length / DOWNSAMPLED_RATE * FEATURE_EXTRACTION_SAMPLE_RATE,
-            cheaptrick.max_frame_size
-        ) |> round |> Int
+        input_n = dio.decimated_frame_length / DOWNSAMPLED_RATE * FEATURE_EXTRACTION_SAMPLE_RATE |> round |> Int
 
         fftfreq = rfftfreq(input_n, FEATURE_EXTRACTION_SAMPLE_RATE)
         mfcc_filter_bank = get_mel_filter_banks(Vector{Float32}(fftfreq); k=MFCC_SIZE+1)
         output_n = size(mfcc_filter_bank)[1]+2
 
-        return new(dio, cheaptrick, mfcc_filter_bank, input_n, hop_size, output_n)
+        return new(dio, mfcc_filter_bank, input_n, hop_size, output_n)
     end
 end
 
@@ -56,16 +51,13 @@ function (fs::FeatureScanner)(xs::AbstractMatrix, ps, st::NamedTuple)
     return fs((xs, (repeat([(value=0f0, confidence=0f0)], size(xs)[2]),)), ps, st)
 end
 
-@load "$(@__DIR__)/feature_means.bson" feature_means
-@load "$(@__DIR__)/feature_stds.bson" feature_stds
-
 unzip(a) = map(x->getfield.(a, x), fieldnames(eltype(a)))
 
 function (fs::FeatureScanner)((xs, (previous_f0s,))::Tuple{<:AbstractMatrix, Tuple{Vector{F0Estimate}}}, ps, st::NamedTuple)
     ys, f0s = [
         begin
             f0 = fs.dio(Vector(x[end-fs.hop_size+1:end]); previous_estimate = f0)
-            spectrogram = fs.cheaptrick(f0.value, Vector(x))
+            spectrogram = log10.(DSP.periodogram(x; fs = fs.dio.sample_rate, window=blackman).power .+ eps(Float32))
             mc = σ.(mfcc(spectrogram; filter_bank = fs.mfcc_filter_bank))
 
             [normalize_pitch(f0.value); f0.confidence; rms(x); mc], f0
@@ -110,23 +102,17 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feat
 
         # to make the job of the analyzers easier, we filter out the frequencies outside of the human vocal range
         Nh = Int(2*FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL)
-        h = digitalfilter(DSP.Bandpass(F0_FLOOR, 4*F0_CEIL; fs=FEATURE_EXTRACTION_SAMPLE_RATE), FIRWindow(ones(Nh)./(Nh)))
+        h = digitalfilter(DSP.Bandpass(F0_FLOOR÷2, 4*F0_CEIL; fs=FEATURE_EXTRACTION_SAMPLE_RATE), FIRWindow(ones(Nh)./(Nh)))
         fir_filter = FIRFilter(h, FEATURE_EXTRACTION_SAMPLE_RATE // sample_rate)
-        stream_filter = StreamFilter(frame_size, fir_filter; pregain=2f0, gain=2f0)
+        stream_filter = StreamFilter(frame_size, fir_filter; pregain=3/2f0, gain=2/3f0)
 
         # models to convert into and from the latent space
         encoder_n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_FLOOR)
-        conv, conv_dims = conv_1d(encoder_n, Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL))
         encoder = Lux.Chain(
-            x -> x[1:encoder_n,:],
-            conv,
-            Lux.Dense(conv_dims, conv_dims, tanh),
-            Lux.Dense(conv_dims, LATENT_DIMS)
+            x -> view(x, 1:encoder_n, :),
+            Lux.Dense(encoder_n, LATENT_DIMS)
         )
-        decoder = Lux.Chain(
-            Lux.Dense(LATENT_DIMS, 2*LATENT_DIMS, sqrt_activation),
-            Lux.Dense(2*LATENT_DIMS, 1)
-        )
+        decoder = Lux.Dense(LATENT_DIMS, 1)
         # model to get trajectories inside the latent space
         # assumes ther are linear plus non-linear parts to the signal
         ode = Lux.Parallel(+;
@@ -141,18 +127,10 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feat
         Δt = LATENT_SPACE_SAMPLE_RATE_SCALER / sample_rate
         T = n * Δt
 
-        base_control = Lux.Chain(
-            Lux.Dense(params_n, params_n, tanh),
-            Lux.Dense(params_n, params_n, tanh),
-            Lux.Dense(params_n, params_n)
-        )
-        speaker_control = speaker ?
-            copy(base_control) :
-            Lux.WrappedFunction(x -> zeros(eltype(x), params_n, size(x)[2]))
-
-        control = Lux.Chain(;
-            feature_filter = TimeStepAwareRNN(feature_scanner.output_n, params_n, identity; dt = T) |> Lux.StatefulRecurrentCell,
-            mlp = Lux.Parallel(+; base_control = base_control, speaker_control = speaker_control)
+        control = Lux.Chain(
+            TimeStepAwareRNN(feature_scanner.output_n, 2*params_n, tanh; dt = T) |> Lux.StatefulRecurrentCell,
+            Lux.Dense(2*params_n, 2*params_n, tanh),
+            Lux.Dense(2*params_n, params_n)
         )
 
         return new(

@@ -27,12 +27,8 @@ function get_training_data(model::hNODEVocoder, sound; β=0f0, drop_mfccs=false)
         filtered_frame_with_noise, stream_filter_st = stream_filter(frame_with_noise, stream_filter_ps, stream_filter_st)
         features, feature_scanner_st = feature_scanner([filtered_frame;;], feature_scanner_ps, feature_scanner_st)
 
-        if drop_mfccs
-            features[4:end,:] = 3*(rand32(Random.default_rng(), MFCC_SIZE) .- 0.5)
-        end
-
         push!(aggregated_input_sound, filtered_frame_with_noise[:])
-        push!(aggregated_target_sound, frame[:])
+        push!(aggregated_target_sound, filtered_frame[1:model.n])
         push!(aggregated_features, features[:])
     end
 
@@ -44,9 +40,9 @@ function get_training_data(model::hNODEVocoder, sound; β=0f0, drop_mfccs=false)
 end
 
 function get_denoising_training_data(model::hNODEVocoder; noise_length=FEATURE_EXTRACTION_SAMPLE_RATE, max_noise_level=0.001f0)
-    sound = zeros(Float32, noise_length)
-    training_data = get_training_data(model, sound; β=max_noise_level)
-    return (training_data..., target=zeros(Float32, size(training_data[1])))
+    sound = max_noise_level*randn(Float32, noise_length)
+    training_data = get_training_data(model, sound; β=0f0)
+    return (training_data..., target=zeros(Float32, size(training_data.target)))
 end
 
 function get_connected_trajectory(model, ps, st, data)
@@ -113,28 +109,37 @@ function train_final_model(
         target_sound = vcat(eachslice(target[1:output_n,:,:]; dims = 2)...)
         generated_sound = Matrix{Float32}(undef, 0, size(target_sound)[2])
 
-        regularization_loss = 0f0
+        encoder_loss = 0f0
         for (input_slice, features_slice) ∈ zip(eachslice(input; dims = 2), eachslice(features; dims = 2))
             (pred_ys, (u0s,)), st = model((input_slice, (u0s, features_slice)), ps, st)
             generated_sound = vcat(generated_sound, pred_ys)
-            regularization_loss += sum(abs, model.control(features_slice, ps.control, st.control)[1])
+
+            encoder_loss += sum(abs2, input_slice[1,:]' - model.decoder(model.encoder(input_slice, ps.encoder, st.encoder)[1], ps.decoder, st.decoder)[1])
         end
-        regularization_loss /= Lux.parameterlength(model.ode)
-        regularization_loss += sum(abs, ComponentArray(ps.encoder)) / length(ComponentArray(ps.encoder))
-                            + sum(abs, ComponentArray(ps.control)) / length(ComponentArray(ps.control))
-                            + sum(abs, ComponentArray(ps.decoder)) / length(ComponentArray(ps.decoder))
-                            + 100*sum(abs, ps.control.feature_filter.Wh)
-                            + 100*sum(exp, real.(eigvals(ps.control.feature_filter.Wh)))
+        # regularization_loss = sum(abs, ComponentArray(ps.encoder)) / length(ComponentArray(ps.encoder))
+        #                     + sum(abs2, ComponentArray(ps.encoder)) / length(ComponentArray(ps.encoder))
+        #                     + sum(abs, ComponentArray(ps.control)) / length(ComponentArray(ps.control))
+        #                     + sum(abs, ComponentArray(ps.decoder)) / length(ComponentArray(ps.decoder))
+        regularization_loss = 0f0
+        raw_loss = sum(abs2, generated_sound - target_sound)
+                 + sum(abs, fft(generated_sound .* window)
+                          .- fft(target_sound .* window))
+                #  + sum(abs2, log10.(abs.(fft(generated_sound .* window)[1:end÷2] .+ eps(Float32)))
+                #           .- log10.(abs.(fft(target_sound .* window)[1:end÷2] .+ eps(Float32))))
 
-        raw_loss = sum(abs2, 100*(generated_sound .- target_sound)) / slices
+        # spectral_loss = begin
+        #     generated_fft = log10.(abs.(fft(generated_sound .* window, 1) .+ eps(Float32)))
+        #     target_fft = log10.(abs.(fft(target_sound .* window, 1) .+ eps(Float32)))
+        #     sum(abs2, generated_fft - target_fft)
+        # end
 
-        spectral_loss = begin
-            generated_fft = fft(generated_sound .* window, 1)
-            target_fft = fft(target_sound .* window, 1)
-            sum(abs2, 100*(abs.(generated_fft) - abs.(target_fft)))
-        end
+        # println("raw_loss $(raw_loss)")
+        # println("spectral_loss $(spectral_loss)")
+        # println("regularization_loss $(regularization_loss)")
+        # println("encoder_loss $(encoder_loss)")
+        # error()
 
-        return (regularization_loss + raw_loss + spectral_loss) / batchsize, st, (nothing,)
+        return regularization_loss + (encoder_loss + raw_loss) / slices / batchsize, st, (nothing,)
     end
 
     ps, st = train(

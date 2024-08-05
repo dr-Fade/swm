@@ -17,7 +17,7 @@ struct DIO
     DIO(f0_ceil, f0_floor, sample_rate; relative_peak_threshold = 0.25, noise_floor = 0.01) = begin
         decimated_frame_length = (3 * DOWNSAMPLED_RATE / f0_floor) |> round |> Int
         window_width = (sample_rate / f0_floor) |> floor |> Int
-        window = DSP.Windows.tukey(window_width, 0.5) |> Vector{Float32} |> FIRWindow
+        window = DSP.Windows.hamming(window_width) |> Vector{Float32} |> FIRWindow
         bands = Int.(exp2.(round(log2(f0_floor)):round(log2(f0_ceil)))[1:end])
         filters = [
             begin
@@ -44,7 +44,7 @@ end
 # decimate the signal and apply different filters to attenuate different harmonics
 attenuate_harmonics(dio::DIO) = sample -> begin
     for ((i, f), buf) ∈ zip(enumerate(dio.filters), dio.buffers)
-        shiftin!(buf, DSP.filt(f, sample) * log2(i+1f0))
+        shiftin!(buf, DSP.filt(f, sample) * i)
     end
     dio.buffers
 end
