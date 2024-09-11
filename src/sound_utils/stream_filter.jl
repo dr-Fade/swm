@@ -1,4 +1,4 @@
-using DSP
+using DSP, Lux
 
 struct StreamFilter <: Lux.AbstractRecurrentCell{false, false}
     pregain::Float32
@@ -8,6 +8,20 @@ struct StreamFilter <: Lux.AbstractRecurrentCell{false, false}
 
     function StreamFilter(n::Int, filter::FIRFilter; gain=1f0, pregain=1f0)
         return new(pregain, gain, filter, n)
+    end
+
+    function StreamFilter(n::Int, sample_rate::Int;
+        target_sample_rate::Int=sample_rate,
+        f0_floor::Float32=20f0,
+        f0_ceil::Float32=1000f0,
+        filter_length::Int=Int(sample_rate÷f0_floor),
+        window=hanning,
+        pregain=1f0,
+        gain=1f0
+    )
+        h = digitalfilter(DSP.Bandpass(f0_floor, f0_ceil; fs=sample_rate), FIRWindow(window(filter_length)))
+        fir_filter = FIRFilter(h, target_sample_rate // sample_rate)
+        return new(pregain, gain, fir_filter, n)
     end
 end
 

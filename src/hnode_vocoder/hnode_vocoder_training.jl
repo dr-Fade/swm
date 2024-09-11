@@ -90,13 +90,17 @@ function train_final_model(
     frames = training_data.input
     target = training_data.target
     features = training_data.features
-    N = size(frames)[2]
-    #data
-    data = (
-        reshape(frames[:,1:end-N%slices], size(frames)[1], slices, N÷slices),
-        reshape(target[:,1:end-N%slices], size(target)[1], slices, N÷slices),
-        reshape(features[:,1:end-N%slices], size(features)[1], slices, N÷slices)
-    )
+    N = size(frames)[end]
+    frames_batches = Array{Float32, 3}(undef, (size(frames)[1], slices, N-slices))
+    target_batches = Array{Float32, 3}(undef, (size(target)[1], slices, N-slices))
+    features_batches = Array{Float32, 3}(undef, (size(features)[1], slices, N-slices))
+
+    for i in 1:N-slices
+        frames_batches[:,:,i] = view(frames, :, i:i+slices-1)
+        target_batches[:,:,i] = view(target, :, i:i+slices-1)
+        features_batches[:,:,i] = view(features, :, i:i+slices-1)
+    end
+    data = (frames_batches, target_batches, features_batches)
     loader = DataLoader(data; batchsize = batchsize, shuffle=true)
 
     window = blackman(output_n*slices)
@@ -116,28 +120,12 @@ function train_final_model(
 
             encoder_loss += sum(abs2, input_slice[1,:]' - model.decoder(model.encoder(input_slice, ps.encoder, st.encoder)[1], ps.decoder, st.decoder)[1])
         end
-        # regularization_loss = sum(abs, ComponentArray(ps.encoder)) / length(ComponentArray(ps.encoder))
-        #                     + sum(abs2, ComponentArray(ps.encoder)) / length(ComponentArray(ps.encoder))
-        #                     + sum(abs, ComponentArray(ps.control)) / length(ComponentArray(ps.control))
-        #                     + sum(abs, ComponentArray(ps.decoder)) / length(ComponentArray(ps.decoder))
+
         regularization_loss = 0f0
         raw_loss = sum(abs2, generated_sound - target_sound)
-                 + sum(abs, fft(generated_sound .* window)
-                          .- fft(target_sound .* window))
-                #  + sum(abs2, log10.(abs.(fft(generated_sound .* window)[1:end÷2] .+ eps(Float32)))
-                #           .- log10.(abs.(fft(target_sound .* window)[1:end÷2] .+ eps(Float32))))
-
-        # spectral_loss = begin
-        #     generated_fft = log10.(abs.(fft(generated_sound .* window, 1) .+ eps(Float32)))
-        #     target_fft = log10.(abs.(fft(target_sound .* window, 1) .+ eps(Float32)))
-        #     sum(abs2, generated_fft - target_fft)
-        # end
-
-        # println("raw_loss $(raw_loss)")
-        # println("spectral_loss $(spectral_loss)")
-        # println("regularization_loss $(regularization_loss)")
-        # println("encoder_loss $(encoder_loss)")
-        # error()
+                 + sum(abs, fft(generated_sound) .- fft(target_sound))
+                 + sum(abs2, log10.(abs.(fft(generated_sound .* window)[1:end÷2] .+ eps(Float32)))
+                          .- log10.(abs.(fft(target_sound .* window)[1:end÷2] .+ eps(Float32))))
 
         return regularization_loss + (encoder_loss + raw_loss) / slices / batchsize, st, (nothing,)
     end

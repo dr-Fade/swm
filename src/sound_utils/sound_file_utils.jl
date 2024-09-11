@@ -1,3 +1,15 @@
+sine_wave = (f0, A, ϕ) -> x -> Float32(A*sin(f0 * 2π * x + ϕ))
+
+harmonic_signal = (f0, A, ϕ, harmonics, range) -> begin
+    res = sum([
+        sine_wave(harmonic*f0, 0.5f0 + 0.5f0rand(Random.default_rng(), Float32), ϕ).(range)
+        for harmonic ∈ 1:harmonics
+    ])
+    res ./= max(maximum(res), 1)
+    res .*= A
+    res
+end
+
 function get_dirs_with_sound(root; file_extensions = [".flac", ".wav"])
     sound_dirs = []
 
@@ -47,8 +59,6 @@ function load_sounds(target_dirs...; file_limit_per_dir = nothing, verbose = tru
 end
 
 function create_synthesized_data(N, f0_floor, f0_ceil, sample_rate; harmonics = 1, output_dir="synthesized_data", max_peak=1.0, f_step=10, noise = 0f0)
-    sine_wave = (f0, A, ϕ) -> x -> Float32(A*sin(f0 * 2π * x + ϕ))
-
     if !isdir(output_dir)
         mkdir(output_dir)
     end
@@ -66,5 +76,12 @@ function create_synthesized_data(N, f0_floor, f0_ceil, sample_rate; harmonics = 
             joinpath(output_dir, "$(f0)_x$(harmonics)_$(sample_rate).wav")
         end
         wavwrite(x, filename; Fs = sample_rate)
+    end
+end
+
+function create_synthetic_data(f0, A, ϕ, harmonics, info_file_name)
+    x = harmonic_signal(f0, A, ϕ, harmonics)
+    open(info_file_name,"a") do file
+        println(file,"$(now()): epoch $epoch/$epochs, loss $(round(l; digits=2))")
     end
 end

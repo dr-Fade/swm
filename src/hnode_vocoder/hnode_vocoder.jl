@@ -101,18 +101,23 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feat
         end
 
         # to make the job of the analyzers easier, we filter out the frequencies outside of the human vocal range
-        Nh = Int(2*FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL)
-        h = digitalfilter(DSP.Bandpass(F0_FLOOR÷2, 4*F0_CEIL; fs=FEATURE_EXTRACTION_SAMPLE_RATE), FIRWindow(ones(Nh)./(Nh)))
-        fir_filter = FIRFilter(h, FEATURE_EXTRACTION_SAMPLE_RATE // sample_rate)
-        stream_filter = StreamFilter(frame_size, fir_filter; pregain=3/2f0, gain=2/3f0)
+        stream_filter = StreamFilter(frame_size, sample_rate;
+            target_sample_rate = FEATURE_EXTRACTION_SAMPLE_RATE,
+            f0_floor = F0_FLOOR,
+            f0_ceil = F0_CEIL
+        )
 
         # models to convert into and from the latent space
         encoder_n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_FLOOR)
         encoder = Lux.Chain(
             x -> view(x, 1:encoder_n, :),
+            Lux.Dense(encoder_n, encoder_n, tanh),
             Lux.Dense(encoder_n, LATENT_DIMS)
         )
-        decoder = Lux.Dense(LATENT_DIMS, 1)
+        decoder = Lux.Chain(
+            Lux.Dense(LATENT_DIMS, 2*LATENT_DIMS, tanh),
+            Lux.Dense(2*LATENT_DIMS, 1)
+        )
         # model to get trajectories inside the latent space
         # assumes ther are linear plus non-linear parts to the signal
         ode = Lux.Parallel(+;
@@ -128,7 +133,7 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feat
         T = n * Δt
 
         control = Lux.Chain(
-            TimeStepAwareRNN(feature_scanner.output_n, 2*params_n, tanh; dt = T) |> Lux.StatefulRecurrentCell,
+            Lux.Dense(params_n, 2*params_n, tanh),
             Lux.Dense(2*params_n, 2*params_n, tanh),
             Lux.Dense(2*params_n, params_n)
         )

@@ -1,6 +1,6 @@
 using Lux, Random, LinearAlgebra
 
-struct HypernetBlock <: Lux.AbstractExplicitContainerLayer
+struct HypernetBlock <: Lux.AbstractExplicitLayer
     control::Lux.AbstractExplicitLayer
     model::Lux.AbstractExplicitLayer
     model_axes::Tuple
