@@ -1,20 +1,37 @@
 using Lux, Random, LinearAlgebra
 
-struct MergeBlock <: Lux.AbstractExplicitLayer
-    n::Integer
+struct MergeLayer <: Lux.AbstractLuxLayer
+    ins::Tuple
+    out::Int
+    connection
     σ::Function
-    function QuadraticBlock(n, σ=identity)
-        new(n, σ)
+    function MergeLayer(io, connection=+, σ=identity)
+        ins, out = io
+        new(ins, out, connection, σ)
     end
 
 end
 
-function (f::QuadraticBlock)(u, ps, st)
-    return f.σ.(u .* ps.W * u), st
+function (f::MergeLayer)(us, ps, st)
+    Ws = ps[:Ws]
+    bs = ps[:bs]
+
+    W_keys = keys(Ws)
+    b_keys = keys(bs)
+
+    results = [
+        f.σ.(Ws[W_key]*u .+ bs[b_key])
+        for (u, W_key, b_key) ∈ zip(us, W_keys, b_keys)
+    ]
+
+    connected_results = reduce(f.connection, results)
+
+    return connected_results, st
 end
 
-Lux.initialparameters(rng::AbstractRNG, f::QuadraticBlock) = (
-    W = rand(rng, Float32, f.n, f.n),
+Lux.initialparameters(rng::AbstractRNG, f::MergeLayer) = (
+    Ws = (; [Symbol("W_$i") => rand(rng, Float32, f.out, f.ins[i]) .- 0.5f0 for i ∈ 1:length(f.ins)]...),
+    bs = (; [Symbol("b_$i") => zeros32(f.out) for i ∈ 1:length(f.ins)]...),
 )
 
-Lux.initialstates(rng::AbstractRNG, f::QuadraticBlock) = NamedTuple()
+Lux.initialstates(rng::AbstractRNG, f::MergeLayer) = NamedTuple()

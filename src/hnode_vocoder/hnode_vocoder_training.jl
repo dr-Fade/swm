@@ -17,7 +17,10 @@ function get_training_data(model::hNODEVocoder, sound; β=0f0, drop_mfccs=false)
 
     aggregated_input_sound = Vector{Vector{Float32}}()
     aggregated_target_sound = Vector{Vector{Float32}}()
-    aggregated_features = Vector{Vector{Float32}}()
+    aggregated_f0s = Vector{Matrix{Float32}}()
+    aggregated_loudness = Vector{Matrix{Float32}}()
+    aggregated_mfccs = Vector{Matrix{Float32}}()
+
 
     for i ∈ 1:frame_size:length(sound)-frame_size
         frame = sound[i:i+frame_size-1]
@@ -29,13 +32,21 @@ function get_training_data(model::hNODEVocoder, sound; β=0f0, drop_mfccs=false)
 
         push!(aggregated_input_sound, filtered_frame_with_noise[:])
         push!(aggregated_target_sound, filtered_frame[1:model.n])
-        push!(aggregated_features, features[:])
+        push!(aggregated_f0s, features[:f0s])
+        push!(aggregated_loudness, features[:loudness])
+        push!(aggregated_mfccs, features[:mfccs])
     end
+
+    aggregated_features = (
+        f0s = reduce(hcat, aggregated_f0s),
+        loudness = reduce(hcat, aggregated_loudness),
+        mfccs = reduce(hcat, aggregated_mfccs)
+    )
 
     return (
         input=hcat(aggregated_input_sound...),
         target=hcat(aggregated_target_sound...),
-        features=hcat(aggregated_features...)
+        features=aggregated_features
     )
 end
 
@@ -58,7 +69,7 @@ function get_connected_trajectory(model, ps, st, data)
     res = Vector{Float32}()
     loss = 0
     for i ∈ 1:size(frames)[2]
-        (pred_ys, (u0s,)), st = model((frames[:,i:i], (u0s, features[:,i:i])), ps, st)
+        (pred_ys, (u0s,)), st = model((frames[:,i:i], (u0s, Tuple(f[:,i:i] for f ∈ features))), ps, st)
         append!(res, pred_ys[:,1])
         loss += sum(abs2, pred_ys .- frames[1:output_n,i])
     end
@@ -81,7 +92,7 @@ end
 
 function train_final_model(
     model::hNODEVocoder, ps, st::NamedTuple, training_data;
-    batchsize = 1, slices = 1, epochs = 1, epoch_cb = nothing, batch_cb = nothing, optimiser = Optimisers.Adam(), distributed_backend = nothing
+    batchsize = 1, slices = 1, epochs = 1, epoch_cb = nothing, batch_cb = nothing, optimiser = Optimisers.Adam(), distributed_backend = nothing, logger=println
 )
     output_n = model.n
 
@@ -91,17 +102,26 @@ function train_final_model(
     target = training_data.target
     features = training_data.features
     N = size(frames)[end]
+    logger("preparing batches...")
     frames_batches = Array{Float32, 3}(undef, (size(frames)[1], slices, N-slices))
     target_batches = Array{Float32, 3}(undef, (size(target)[1], slices, N-slices))
-    features_batches = Array{Float32, 3}(undef, (size(features)[1], slices, N-slices))
+    features_batches = (
+        f0s = Array{Float32, 3}(undef, (size(features[:f0s])[1], slices, N-slices)),
+        loudness = Array{Float32, 3}(undef, (size(features[:loudness])[1], slices, N-slices)),
+        mfccs = Array{Float32, 3}(undef, (size(features[:mfccs])[1], slices, N-slices)),
+    )
 
     for i in 1:N-slices
         frames_batches[:,:,i] = view(frames, :, i:i+slices-1)
         target_batches[:,:,i] = view(target, :, i:i+slices-1)
-        features_batches[:,:,i] = view(features, :, i:i+slices-1)
+        features_batches[:f0s][:,:,i] = view(features[:f0s], :, i:i+slices-1)
+        features_batches[:loudness][:,:,i] = view(features[:loudness], :, i:i+slices-1)
+        features_batches[:mfccs][:,:,i] = view(features[:mfccs], :, i:i+slices-1)
     end
     data = (frames_batches, target_batches, features_batches)
     loader = DataLoader(data; batchsize = batchsize, shuffle=true)
+
+    logger("prepared $(N-slices) batches.")
 
     window = blackman(output_n*slices)
     #training
@@ -114,20 +134,35 @@ function train_final_model(
         generated_sound = Matrix{Float32}(undef, 0, size(target_sound)[2])
 
         encoder_loss = 0f0
-        for (input_slice, features_slice) ∈ zip(eachslice(input; dims = 2), eachslice(features; dims = 2))
+        for (input_slice, f0s_slice, loudness_slice, mfccs_slice) ∈ zip(
+            eachslice(input; dims = 2),
+            eachslice(features[:f0s]; dims = 2),
+            eachslice(features[:loudness]; dims = 2),
+            eachslice(features[:mfccs]; dims = 2)
+        )
+            features_slice = (f0s_slice, loudness_slice, mfccs_slice)
             (pred_ys, (u0s,)), st = model((input_slice, (u0s, features_slice)), ps, st)
             generated_sound = vcat(generated_sound, pred_ys)
 
-            encoder_loss += sum(abs2, input_slice[1,:]' - model.decoder(model.encoder(input_slice, ps.encoder, st.encoder)[1], ps.decoder, st.decoder)[1])
+            latent_xs = model.encoder(input_slice, ps.encoder, st.encoder)[1]
+            recovered_xs = model.decoder(latent_xs, ps.decoder, st.decoder)[1]
+            encoder_loss += sum(abs2, 1000*(input_slice[1,:]' - recovered_xs)) + sum(abs2, 1000*recovered_xs)
         end
 
-        regularization_loss = 0f0
-        raw_loss = sum(abs2, generated_sound - target_sound)
-                 + sum(abs, fft(generated_sound) .- fft(target_sound))
-                 + sum(abs2, log10.(abs.(fft(generated_sound .* window)[1:end÷2] .+ eps(Float32)))
-                          .- log10.(abs.(fft(target_sound .* window)[1:end÷2] .+ eps(Float32))))
+        ps_array = ComponentArray(ps)
+        regularization_loss = sum(abs, ps_array) / length(ps_array)
+        raw_loss = sum(abs2, 100*(generated_sound - target_sound))
+        spectral_loss = if size(generated_sound)[1] > model.sample_rate / F0_FLOOR
+            sum(abs, fft(generated_sound) .- fft(target_sound))
+             + sum(abs2, log10.(abs.(fft(generated_sound .* window)[1:end÷2] .+ eps(Float32)))
+                      .- log10.(abs.(fft(target_sound .* window)[1:end÷2] .+ eps(Float32))))
+        else
+            0f0
+        end
 
-        return regularization_loss + (encoder_loss + raw_loss) / slices / batchsize, st, (nothing,)
+        # println("raw_loss=$(raw_loss), spectral_loss=$(spectral_loss), encoder_loss=$(encoder_loss), regularization_loss=$(regularization_loss)")
+
+        return regularization_loss + ((encoder_loss + raw_loss) / slices + spectral_loss) / batchsize, st, (nothing,)
     end
 
     ps, st = train(

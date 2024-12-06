@@ -38,14 +38,7 @@ function chunk_data(data::Matrix, chunk_size::Int; step::Int = 1)
 end
 
 function init_training_state(model, ps, st, optimiser, distributed_backend=nothing)
-    rng = Random.default_rng()
-    tstate = Lux.Training.TrainState(rng, model, isnothing(distributed_backend) ? optimiser : DistributedUtils.DistributedOptimizer(distributed_backend, optimiser))
-    if !isnothing(ps)
-        Setfield.@set! tstate.parameters = ps
-    end
-    if !isnothing(st)
-        Setfield.@set! tstate.states = st
-    end
+    tstate = Lux.Training.TrainState(model, ps, st, isnothing(distributed_backend) ? optimiser : DistributedUtils.DistributedOptimizer(distributed_backend, optimiser))
     if !isnothing(distributed_backend)
         Setfield.@set! tstate.parameters = DistributedUtils.synchronize!!(distributed_backend, tstate.parameters)
         Setfield.@set! tstate.states = DistributedUtils.synchronize!!(distributed_backend, tstate.states)
@@ -74,8 +67,19 @@ function train(
     while epoch <= epochs    
         for (batch_i, batch) ∈ enumerate(data)
             try
-                grads, loss, stats, tstate = Lux.Experimental.compute_gradients(zygote, loss_function, batch, tstate)
-                tstate = Lux.Experimental.apply_gradients(tstate, grads)
+                grads, loss, stats, tstate = Lux.Training.compute_gradients(zygote, loss_function, batch, tstate)
+
+                if any(x -> !isnothing(x) && isnan(x), ComponentArray(grads))
+                    println("$epoch/$epochs ($batch_i/$batch_N): NaNs detected in gradients, not applying.")
+                    continue
+                    # println("$epoch/$epochs ($batch_i/$batch_N): Replacing NaNs in gradients with random values")
+                    # grads = map(x -> isnothing(x) ? x : isnan(x) ? 0.0001f0*(rand(Float32)-0.5f0) : x, ComponentArray(grads))
+                end
+                prev_params = tstate.parameters
+                tstate = Lux.Training.apply_gradients(tstate, grads)
+                if any(isnan, ComponentArray(tstate.parameters))
+                    error("NaN detected in the parameters!")
+                end
             finally
                 for state in states_to_clear
                     Setfield.@set! tstate.states = Lux.update_state(tstate.states, state, nothing)
