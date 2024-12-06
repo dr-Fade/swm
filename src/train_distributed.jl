@@ -29,7 +29,9 @@ root_log("initialized $total_workers workers")
 # load the model and parameters
 include("hnode_vocoder/hnode_vocoder_training.jl");
 
-model = hNODEVocoder(FEATURE_EXTRACTION_SAMPLE_RATE; n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ F0_CEIL), speaker = false)
+model = hNODEVocoder(FEATURE_EXTRACTION_SAMPLE_RATE; n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ F0_CEIL) ÷ 2)
+
+while true
 
 rng = Random.default_rng()
 model_filename = ARGS[1]
@@ -44,13 +46,13 @@ end
 
 # training and test data dirs
 # TODO: replace with cli args parsing
-dev_voice_sounds = "src/samples/LibriSpeech/dev-clean"
+dev_voice_sounds = "src/samples/LibriSpeech/dev-clean/1272"
 synthetic_data = "src/samples/synthesized_sounds"
 test_data_dir = "src/samples/LibriSpeech/test"
 
 # load files on the root worker and broadcast to everyone else
 sounds = MPI.bcast(
-    load_sounds(dev_voice_sounds; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, file_limit_per_dir = total_workers, verbose = local_rank==0, shuffle_files = true),
+    load_sounds(dev_voice_sounds; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, file_limit_per_dir = 1, verbose = local_rank==0, shuffle_files = true),
     backend.comm
 )
 
@@ -71,9 +73,9 @@ training_data = get_training_data(model, concatenated_sounds)
 synthetic_training_data = begin
     st_sounds = load_sounds(synthetic_data; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, verbose = local_rank==0, shuffle_files = true)
     st_concatenated_sounds = vcat([vcat(zeros(Float32, 1000), s) for s in st_sounds]...)
-    get_training_data(model, st_concatenated_sounds)
+    get_training_data(model, st_concatenated_sounds; β=0.001f0)
 end
-denoising_training_data = get_denoising_training_data(model; noise_length=max(length(concatenated_sounds)÷30, 5*FEATURE_EXTRACTION_SAMPLE_RATE), max_noise_level=0.0005f0)
+denoising_training_data = get_denoising_training_data(model; noise_length=max(length(concatenated_sounds)÷30, 5*FEATURE_EXTRACTION_SAMPLE_RATE), max_noise_level=0.01f0)
 
 log("loaded $(size(training_data.input)[2]) training samples")
 log("loaded $(size(synthetic_training_data.input)[2]) synthetic samples")
@@ -82,7 +84,11 @@ log("loaded $(size(denoising_training_data.input)[2]) denoising training samples
 training_data = (
     input = hcat(training_data.input, synthetic_training_data.input, denoising_training_data.input),
     target = hcat(training_data.target, synthetic_training_data.target, denoising_training_data.target),
-    features = hcat(training_data.features, synthetic_training_data.features, denoising_training_data.features)
+    features = (
+        f0s = hcat(training_data.features[:f0s], synthetic_training_data.features[:f0s], denoising_training_data.features[:f0s]),
+        loudness = hcat(training_data.features[:loudness], synthetic_training_data.features[:loudness], denoising_training_data.features[:loudness]),
+        mfccs = hcat(training_data.features[:mfccs], synthetic_training_data.features[:mfccs], denoising_training_data.features[:mfccs])
+    )
 )
 
 test_data = nothing
@@ -138,23 +144,32 @@ function batch_cb(loss_function, model, ps, st, batch_i, batch_n, epoch)
     if batch_i == batch_n || batch_i % BATCHES_BETWEEN_CHECKPOINTS == 0
         log_str = "$(now()): epoch $epoch, batch $batch_i/$batch_n"
         root_log(log_str)
-        @save model_filename ps
-        open("training_log.txt","a") do file
-            println(file, log_str)
-        end
+        # open("training_log.txt","a") do file
+        #     println(file, log_str)
+        # end
     end
+
+    @save model_filename ps
 
     return false
 end
 
-ps, st = train_final_model(
-    model, ps, st,
-    training_data;
-    batchsize = 256,
-    slices = 8,
-    optimiser = Optimisers.ADAM(1e-4),
-    epochs = 4,
-    epoch_cb = epoch_cb,
-    batch_cb = batch_cb,
-    distributed_backend = backend
-)
+try
+    ps, st = train_final_model(
+        model, ps, st,
+        training_data;
+        batchsize = 128,
+        slices = 2,
+        optimiser = Optimisers.ADAM(1e-3),
+        epochs = 4,
+        epoch_cb = epoch_cb,
+        batch_cb = batch_cb,
+        distributed_backend = backend,
+        logger = log
+    )
+    break
+catch e
+    println(e)
+end
+
+end

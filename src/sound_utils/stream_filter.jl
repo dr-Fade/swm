@@ -1,6 +1,6 @@
 using DSP, Lux
 
-struct StreamFilter <: Lux.AbstractRecurrentCell{false, false}
+struct StreamFilter <: Lux.AbstractRecurrentCell
     pregain::Float32
     gain::Float32
     filter::FIRFilter

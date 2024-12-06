@@ -1,7 +1,7 @@
 using BSON: @load, @save
 using DynamicalSystems, DifferentialEquations, ComponentArrays, DiffEqFlux, Random
 
-include("../nn/time_step_aware_rnn.jl")
+include("../nn/merge_block.jl")
 include("../nn/activation_functions.jl")
 include("../nn/conv_1d.jl")
 include("../sound_utils/dio.jl")
@@ -27,7 +27,7 @@ const LATENT_SPACE_SAMPLE_RATE_SCALER::Float32 = 2000
 const MFCC_SIZE::Int = 29
 
 # the scanner is a recurrent network because DIO requires f0 info from the previous frame
-struct FeatureScanner <: Lux.AbstractRecurrentCell{false, false}
+struct FeatureScanner <: Lux.AbstractRecurrentCell
     dio::DIO
     mfcc_filter_bank::Matrix{Float32}
     input_n::Int
@@ -58,23 +58,24 @@ function (fs::FeatureScanner)((xs, (previous_f0s,))::Tuple{<:AbstractMatrix, Tup
         begin
             f0 = fs.dio(Vector(x[end-fs.hop_size+1:end]); previous_estimate = f0)
             spectrogram = log10.(DSP.periodogram(x; fs = fs.dio.sample_rate, window=blackman).power .+ eps(Float32))
-            mc = σ.(mfcc(spectrogram; filter_bank = fs.mfcc_filter_bank))
+            mc = mfcc(spectrogram; filter_bank = fs.mfcc_filter_bank)
 
-            [normalize_pitch(f0.value); f0.confidence; rms(x); mc], f0
+            [f0.value; f0.confidence; rms(x); mc], f0
         end
         for (x, f0) ∈ zip(eachcol(xs), previous_f0s)
     ] |> unzip
+    ys = reduce(hcat, ys)
 
-    return (reduce(hcat, ys), (f0s,)), st
+    return ((f0s=ys[1:2,:], loudness=ys[3:3, :], mfccs=ys[4:end,:]), (f0s,)), st
 end
 
-struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feature_scanner, :control, :encoder, :decoder)}
-    stream_filter::Lux.AbstractExplicitLayer
-    feature_scanner::Lux.AbstractExplicitLayer
-    control::Lux.AbstractExplicitLayer
-    encoder::Lux.AbstractExplicitLayer
-    decoder::Lux.AbstractExplicitLayer
-    ode::Lux.AbstractExplicitLayer
+struct hNODEVocoder <: Lux.AbstractLuxContainerLayer{(:stream_filter, :feature_scanner, :control, :encoder, :decoder)}
+    stream_filter::Lux.AbstractLuxLayer
+    feature_scanner::Lux.AbstractLuxLayer
+    control::Lux.AbstractLuxLayer
+    encoder::Lux.AbstractLuxLayer
+    decoder::Lux.AbstractLuxLayer
+    ode::Lux.AbstractLuxLayer
     ode_axes::Tuple
 
     sample_rate::Integer
@@ -86,8 +87,6 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feat
     function hNODEVocoder(
         sample_rate;
         n = Integer(sample_rate ÷ F0_CEIL),
-        # whether or not to include the speaker model to go from eigenvoice to specific speaker
-        speaker = true
     )
         # analyzers to get MFCC, F0, aperiodicity, etc
         feature_scanner = FeatureScanner(n)
@@ -103,23 +102,30 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feat
         # to make the job of the analyzers easier, we filter out the frequencies outside of the human vocal range
         stream_filter = StreamFilter(frame_size, sample_rate;
             target_sample_rate = FEATURE_EXTRACTION_SAMPLE_RATE,
-            f0_floor = F0_FLOOR,
-            f0_ceil = F0_CEIL
+            f0_floor = F0_FLOOR / 2f0,
+            f0_ceil = FEATURE_EXTRACTION_SAMPLE_RATE / 2f0 - 1
         )
 
         # models to convert into and from the latent space
         encoder_n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_FLOOR)
+        encoder_conv, envoder_conv_n = conv_1d(encoder_n, Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL); depth=2)
         encoder = Lux.Chain(
             x -> view(x, 1:encoder_n, :),
-            Lux.Dense(encoder_n, encoder_n, tanh),
-            Lux.Dense(encoder_n, LATENT_DIMS)
+            encoder_conv,
+            Lux.Dense(envoder_conv_n, envoder_conv_n, leaky_tanh()),
+            Lux.Dense(envoder_conv_n, LATENT_DIMS)
         )
         decoder = Lux.Chain(
-            Lux.Dense(LATENT_DIMS, 2*LATENT_DIMS, tanh),
-            Lux.Dense(2*LATENT_DIMS, 1)
+            SkipConnection(
+                Chain(
+                    Dense(LATENT_DIMS, 2*LATENT_DIMS, leaky_tanh()),
+                    Dense(2*LATENT_DIMS, LATENT_DIMS, leaky_tanh())
+                ), +
+            ),
+            Dense(LATENT_DIMS, 1)
         )
         # model to get trajectories inside the latent space
-        # assumes ther are linear plus non-linear parts to the signal
+        # assumes there are linear plus non-linear parts to the signal
         ode = Lux.Parallel(+;
             name = "ode",
             linear_block = Lux.Dense(LATENT_DIMS, LATENT_DIMS),
@@ -133,9 +139,9 @@ struct hNODEVocoder <: Lux.AbstractExplicitContainerLayer{(:stream_filter, :feat
         T = n * Δt
 
         control = Lux.Chain(
-            Lux.Dense(params_n, 2*params_n, tanh),
-            Lux.Dense(2*params_n, 2*params_n, tanh),
-            Lux.Dense(2*params_n, params_n)
+            MergeLayer((2, 1, MFCC_SIZE) => 4*params_n, +, leaky_tanh()),
+            Lux.Dense(4*params_n, 4*params_n, leaky_tanh()),
+            Lux.Dense(4*params_n, params_n)
         )
 
         return new(
@@ -204,12 +210,12 @@ function (m::hNODEVocoder)(
     sound = filter_if_needed(m, sound, st)
     features, st_feature_scanner = m.feature_scanner(sound, ps.feature_scanner, st.feature_scanner)
 
-    return m((sound, (u0, features)), ps, (st..., feature_scanner = st_feature_scanner, filtered = true))
+    return m((sound, (u0, Tuple(features))), ps, (st..., feature_scanner = st_feature_scanner, filtered = true))
 end
 
 # third stage - use the feature vector to get the control for ode and integrate it using the embedded sound as u0
 function (m::hNODEVocoder)(
-    (_, (u0, features))::Tuple{<:AbstractMatrix, Tuple{<:AbstractMatrix, <:AbstractMatrix}},
+    (_, (u0, features))::Tuple{<:AbstractMatrix, Tuple{<:AbstractMatrix, Tuple}},
     ps,
     st::NamedTuple
 )
@@ -228,7 +234,7 @@ function (m::hNODEVocoder)(
 
             decoded_trajectory', new_u0
         end
-        for i ∈ 1:size(features)[2]
+        for i ∈ 1:size(u0)[2]
     ] |> unzip
 
     ys = hcat(ys...)

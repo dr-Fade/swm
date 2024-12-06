@@ -3,6 +3,7 @@ using Lux, Random, DSP, FFTW, Statistics
 include("stream_filter.jl")
 include("mel.jl")
 include("../nn/activation_functions.jl")
+include("../nn/conv_1d.jl")
 
 PITCH_DETECTION_SAMPLE_RATE::Int = 4000
 
@@ -12,41 +13,18 @@ const F0_FLOOR::Float32 = 60f0
 normalize_pitch(f0) = hz_to_mel(f0) / MEL_HZ_INTERSECTION
 denormalize_pitch(normalized_f0) = mel_to_hz(normalized_f0 * MEL_HZ_INTERSECTION)
 
-conv_1d_output_dims(n, k; depth=1) =
-    if depth == 1
-        n - k + 1
-    else
-        conv_1d_output_dims(n, k; depth=depth-1) - k + 1
-    end
-
-conv_1d(n, k; depth=1) = Lux.Chain(
-    Lux.ReshapeLayer((n, 1)),
-    [Lux.Conv((k,), 1=>1) for _ in 1:depth],
-    Lux.FlattenLayer(),
-), conv_1d_output_dims(n,k;depth=depth)
-
-struct NeuralPitchDetector <: Lux.AbstractExplicitContainerLayer{(:memory, :estimator)}
+struct NeuralPitchDetector <: Lux.AbstractLuxWrapperLayer{(:memory, :estimator)}
     input_n::Int
-    fir_filter::FIRFilter
-    decimated_input_n::Int
-    memory::Lux.AbstractRecurrentCell
-    estimator::Lux.AbstractExplicitLayer
-    sample_rate::Float32
+    estimator::Lux.AbstractLuxLayer
 
-    function NeuralPitchDetector(sample_rate::Int)
-        filter_window_width = 2*(sample_rate / F0_CEIL) |> floor |> Int
-        filter_window = blackman(filter_window_width) |> Vector{Float32} |> FIRWindow
-        h = digitalfilter(DSP.Lowpass(2*F0_CEIL; fs=sample_rate), filter_window) |> Vector{Float32}
-        fir_filter = FIRFilter(h, PITCH_DETECTION_SAMPLE_RATE // sample_rate)
+    function NeuralPitchDetector()
+        input_n = (PITCH_DETECTION_SAMPLE_RATE / F0_FLOOR) |> floor |> Int
 
-        decimated_input_n = Int(PITCH_DETECTION_SAMPLE_RATE ÷ F0_CEIL)
-        input_n = (decimated_input_n * sample_rate / PITCH_DETECTION_SAMPLE_RATE) |> floor |> Int
-
-        memory_n = 256
-        memory = Lux.GRUCell(decimated_input_n => memory_n; init_state=rand32)
+        conv_net, conv_n = conv_1d(memory_n, PITCH_DETECTION_SAMPLE_RATE ÷ F0_FLOOR |> Int; depth=3)
         estimator = Lux.Chain(
-            Lux.Dense(memory_n, memory_n, tanh),
-            Lux.Dense(memory_n, 1, σ)
+            SkipConnection(conv_net, 1),
+            Lux.Dense(conv_n, conv_n, tanh),
+            Lux.Dense(conv_n, 1, σ)
         )
 
         return new(
