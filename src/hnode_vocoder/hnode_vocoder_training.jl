@@ -134,6 +134,7 @@ function train_final_model(
         generated_sound = Matrix{Float32}(undef, 0, size(target_sound)[2])
 
         encoder_loss = 0f0
+        control_loss = 0f0
         for (input_slice, f0s_slice, loudness_slice, mfccs_slice) ∈ zip(
             eachslice(input; dims = 2),
             eachslice(features[:f0s]; dims = 2),
@@ -146,23 +147,22 @@ function train_final_model(
 
             latent_xs = model.encoder(input_slice, ps.encoder, st.encoder)[1]
             recovered_xs = model.decoder(latent_xs, ps.decoder, st.decoder)[1]
-            encoder_loss += sum(abs2, 1000*(input_slice[1,:]' - recovered_xs)) + sum(abs2, 1000*recovered_xs)
+            encoder_loss += sum(abs2, 1000 * (input_slice[1,:]' - recovered_xs)) + sum(abs2, latent_xs) + sum(abs, latent_xs)
+
+            control, _ = model.control(features_slice, ps.control, st.control)
+            control_loss = sum(abs, control) / length(control) # + sum(abs2, control)
         end
 
         ps_array = ComponentArray(ps)
         regularization_loss = sum(abs, ps_array) / length(ps_array)
-        raw_loss = sum(abs2, 100*(generated_sound - target_sound))
-        spectral_loss = if size(generated_sound)[1] > model.sample_rate / F0_FLOOR
-            sum(abs, fft(generated_sound) .- fft(target_sound))
-             + sum(abs2, log10.(abs.(fft(generated_sound .* window)[1:end÷2] .+ eps(Float32)))
-                      .- log10.(abs.(fft(target_sound .* window)[1:end÷2] .+ eps(Float32))))
-        else
-            0f0
-        end
+        raw_loss = sum(abs2, 1000*(generated_sound - target_sound))
+        spectral_loss = 0f0
+        # spectral_loss = sum(abs2, (log10.(abs.(fft(generated_sound .* window) .+ eps(Float32)))
+        #                         .- log10.(abs.(fft(target_sound .* window) .+ eps(Float32)))))
 
-        # println("raw_loss=$(raw_loss), spectral_loss=$(spectral_loss), encoder_loss=$(encoder_loss), regularization_loss=$(regularization_loss)")
+        # logger("raw_loss=$(raw_loss), spectral_loss=$(spectral_loss), encoder_loss=$(encoder_loss), regularization_loss=$(regularization_loss), control_loss=$(control_loss)")
 
-        return regularization_loss + ((encoder_loss + raw_loss) / slices + spectral_loss) / batchsize, st, (nothing,)
+        return control_loss + regularization_loss + ((encoder_loss + raw_loss) / slices + spectral_loss) / batchsize, st, (nothing,)
     end
 
     ps, st = train(

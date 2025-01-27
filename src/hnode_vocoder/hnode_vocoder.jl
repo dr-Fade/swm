@@ -86,7 +86,7 @@ struct hNODEVocoder <: Lux.AbstractLuxContainerLayer{(:stream_filter, :feature_s
 
     function hNODEVocoder(
         sample_rate;
-        n = Integer(sample_rate ÷ F0_CEIL),
+        n = Integer(2*sample_rate ÷ F0_CEIL),
     )
         # analyzers to get MFCC, F0, aperiodicity, etc
         feature_scanner = FeatureScanner(n)
@@ -108,12 +108,12 @@ struct hNODEVocoder <: Lux.AbstractLuxContainerLayer{(:stream_filter, :feature_s
 
         # models to convert into and from the latent space
         encoder_n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_FLOOR)
-        encoder_conv, envoder_conv_n = conv_1d(encoder_n, Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL); depth=2)
+        encoder_conv, enсoder_conv_n = conv_1d(encoder_n, Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL); depth=2)
         encoder = Lux.Chain(
             x -> view(x, 1:encoder_n, :),
             encoder_conv,
-            Lux.Dense(envoder_conv_n, envoder_conv_n, leaky_tanh()),
-            Lux.Dense(envoder_conv_n, LATENT_DIMS)
+            Lux.Dense(enсoder_conv_n, enсoder_conv_n, leaky_tanh()),
+            Lux.Dense(enсoder_conv_n, LATENT_DIMS)
         )
         decoder = Lux.Chain(
             SkipConnection(
@@ -140,6 +140,7 @@ struct hNODEVocoder <: Lux.AbstractLuxContainerLayer{(:stream_filter, :feature_s
 
         control = Lux.Chain(
             MergeLayer((2, 1, MFCC_SIZE) => 4*params_n, +, leaky_tanh()),
+            Lux.Dense(4*params_n, 4*params_n, leaky_tanh()),
             Lux.Dense(4*params_n, 4*params_n, leaky_tanh()),
             Lux.Dense(4*params_n, params_n)
         )
@@ -237,8 +238,8 @@ function (m::hNODEVocoder)(
         for i ∈ 1:size(u0)[2]
     ] |> unzip
 
-    ys = hcat(ys...)
-    un = hcat(un...)
+    ys = reduce(hcat, ys)
+    un = reduce(hcat, un)
 
     return (ys, (un,)), (st..., control = control_st, filtered = false)
 end

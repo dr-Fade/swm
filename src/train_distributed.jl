@@ -1,6 +1,6 @@
 using Pkg
 
-Pkg.instantiate(); Pkg.precompile();
+Pkg.instantiate(); Pkg.precompile(io=devnull);
 
 using Lux, MPI
 
@@ -13,7 +13,7 @@ const BATCHES_BETWEEN_CHECKPOINTS = 10
 
 const local_rank = DistributedUtils.local_rank(backend)
 const total_workers = DistributedUtils.total_workers(backend)
-const worker_id = "$(readchomp(`hostname`)):$local_rank"
+const worker_id = "$local_rank"
 
 function log(msg)
     suffix = local_rank == 0 ? " [ROOT]" : ""
@@ -29,7 +29,7 @@ root_log("initialized $total_workers workers")
 # load the model and parameters
 include("hnode_vocoder/hnode_vocoder_training.jl");
 
-model = hNODEVocoder(FEATURE_EXTRACTION_SAMPLE_RATE; n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ F0_CEIL) ÷ 2)
+model = hNODEVocoder(FEATURE_EXTRACTION_SAMPLE_RATE; n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE ÷ F0_CEIL) ÷ 3)
 
 while true
 
@@ -46,36 +46,25 @@ end
 
 # training and test data dirs
 # TODO: replace with cli args parsing
-dev_voice_sounds = "src/samples/LibriSpeech/dev-clean/1272"
-synthetic_data = "src/samples/synthesized_sounds"
-test_data_dir = "src/samples/LibriSpeech/test"
+dev_voice_files = repeat(get_all_sound_files("src/samples/LibriSpeech/demo"), 20)
+synthetic_files = shuffle(get_all_sound_files("src/samples/synthesized_sounds"))[1:20]
 
-# load files on the root worker and broadcast to everyone else
-sounds = MPI.bcast(
-    load_sounds(dev_voice_sounds; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, file_limit_per_dir = 1, verbose = local_rank==0, shuffle_files = true),
-    backend.comm
-)
+log("picked $(length(synthetic_files) + length(dev_voice_files)) files")
 
-root_log("loaded $(length(sounds)) files in total")
-
-# filter out the files based on the local rank of each worker
-sounds = sounds[local_rank+1:total_workers:end]
-
-log("picked $(length(sounds)) files")
-
-concatenated_sounds = vcat([vcat(zeros(Float32, 1000), s) for s in sounds]...)
-N = MPI.Reduce(length(concatenated_sounds), min, backend.comm)
+# truncate the total sound length to ensure all workers finish at the same time
+dev_voice_sounds = get_sound(dev_voice_files)
+N = MPI.Reduce(length(dev_voice_sounds), min, backend.comm)
 N = MPI.bcast(N, backend.comm)
+dev_voice_sounds = dev_voice_sounds[1:N]
 
-concatenated_sounds = concatenated_sounds[1:N]
+synthetic_sounds = get_sound(synthetic_files)
+N = MPI.Reduce(length(synthetic_sounds), min, backend.comm)
+N = MPI.bcast(N, backend.comm)
+synthetic_sounds = synthetic_sounds[1:N]
 
-training_data = get_training_data(model, concatenated_sounds)
-synthetic_training_data = begin
-    st_sounds = load_sounds(synthetic_data; target_sample_rate=FEATURE_EXTRACTION_SAMPLE_RATE, verbose = local_rank==0, shuffle_files = true)
-    st_concatenated_sounds = vcat([vcat(zeros(Float32, 1000), s) for s in st_sounds]...)
-    get_training_data(model, st_concatenated_sounds; β=0.001f0)
-end
-denoising_training_data = get_denoising_training_data(model; noise_length=max(length(concatenated_sounds)÷30, 5*FEATURE_EXTRACTION_SAMPLE_RATE), max_noise_level=0.01f0)
+training_data = get_training_data(model, dev_voice_sounds)
+synthetic_training_data = get_training_data(model, synthetic_sounds; β=0.01f0)
+denoising_training_data = get_denoising_training_data(model; noise_length=min(length(synthetic_sounds), length(dev_voice_sounds)) ÷ 2, max_noise_level=0.01f0)
 
 log("loaded $(size(training_data.input)[2]) training samples")
 log("loaded $(size(synthetic_training_data.input)[2]) synthetic samples")
@@ -95,6 +84,7 @@ test_data = nothing
 test_sound = nothing
 
 if local_rank == 0
+    test_data_dir = "src/samples/LibriSpeech/test"
     test_data = get_training_data(model, vcat(load_sounds(test_data_dir)...))
     test_sound = vcat(eachcol(test_data.target[1:model.n,:])...)
     log("loaded $(size(test_data.target)[2]) test samples")
@@ -123,10 +113,10 @@ function epoch_cb(_, epoch, epochs, model, ps, st)
         l = sum(abs2, test_sound .- ys)
 
         savefig(plt, "training_results/$(now())_$(l).png")
-        @save "training_results/$(now())_hnode_vocoder_params.bson" ps
     catch e 
         @warn e
     finally
+        @save "training_results/$(now())_hnode_vocoder_params.bson" ps
         open("training_log.txt","a") do file
             println(file,"$(now()): epoch $epoch/$epochs, loss $(round(l; digits=2))")
         end
@@ -144,12 +134,8 @@ function batch_cb(loss_function, model, ps, st, batch_i, batch_n, epoch)
     if batch_i == batch_n || batch_i % BATCHES_BETWEEN_CHECKPOINTS == 0
         log_str = "$(now()): epoch $epoch, batch $batch_i/$batch_n"
         root_log(log_str)
-        # open("training_log.txt","a") do file
-        #     println(file, log_str)
-        # end
+        @save model_filename ps
     end
-
-    @save model_filename ps
 
     return false
 end
@@ -158,10 +144,10 @@ try
     ps, st = train_final_model(
         model, ps, st,
         training_data;
-        batchsize = 128,
-        slices = 2,
-        optimiser = Optimisers.ADAM(1e-3),
-        epochs = 4,
+        batchsize = 32 ÷ total_workers,
+        slices = 3,
+        optimiser = Optimisers.ADAM(1e-4),
+        epochs = 2,
         epoch_cb = epoch_cb,
         batch_cb = batch_cb,
         distributed_backend = backend,

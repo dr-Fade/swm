@@ -14,7 +14,7 @@ struct StreamFilter <: Lux.AbstractRecurrentCell
         target_sample_rate::Int=sample_rate,
         f0_floor::Float32=20f0,
         f0_ceil::Float32=1000f0,
-        filter_length::Int=Int(sample_rate÷f0_floor),
+        filter_length::Int=Int(target_sample_rate÷f0_floor),
         window=hanning,
         pregain=1f0,
         gain=1f0
