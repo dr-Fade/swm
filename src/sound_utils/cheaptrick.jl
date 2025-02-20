@@ -75,5 +75,5 @@ end
             cepstrum[end-i+1] = 0.0
         end
     end
-    map(x -> isnan(x) ? eps(Float32) : x, ifft(cepstrum) .|> real)
+    map(x -> isnan(x) ? floatmin(Float32) : x, ifft(cepstrum) .|> real)
 end

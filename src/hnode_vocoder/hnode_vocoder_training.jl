@@ -4,7 +4,7 @@ include("../sound_utils/sound_file_utils.jl")
 
 using FLAC, FileIO, BSON, Dates, WAV, Plots, Distributed
 
-function get_training_data(model::hNODEVocoder, sound; β=0f0, drop_mfccs=false)
+function get_training_data(model::hNODEVocoder, sound; β=0f0)
     frame_size = model.n
 
     feature_scanner = model.feature_scanner
@@ -76,6 +76,29 @@ function get_connected_trajectory(model, ps, st, data)
     return res, loss
 end
 
+function get_cheese_connected_trajectory(model, ps, st, data)
+    frames, features = data
+
+    m = size(frames)[2]
+    output_n = model.n
+    total_output_n = output_n * m
+
+    window = blackman(2*output_n)
+    res = zeros32(total_output_n)
+    loss = 0
+    for i ∈ 1:(m-1)
+        u0s = model.encoder(frames[:,i:i], ps.encoder, st.encoder)[1]
+        (pred_ys_left, (u0s,)), st = model((frames[:,i:i], (u0s, Tuple(f[:,i:i] for f ∈ features))), ps, st)
+        (pred_ys_right, (u0s,)), st = model((frames[:,i:i], (u0s, Tuple(f[:,i:i] for f ∈ features))), ps, st)
+        windowed_pred = window .* vcat(pred_ys_left[:,1], pred_ys_right[:,1])
+        left = (i-1)*output_n + 1
+        right = left + 2*output_n - 1
+        res[left:right] += windowed_pred
+        loss += sum(abs2, res[left:(left+output_n-1)] .- frames[1:output_n,i])
+    end
+    return res, loss
+end
+
 psum(f, xs) = begin
     ch = Channel(Threads.nthreads())
     res = 0
@@ -123,7 +146,10 @@ function train_final_model(
 
     logger("prepared $(N-slices) batches.")
 
-    window = blackman(output_n*slices)
+    M = output_n*slices
+    window = blackman(M)
+    fftfreq = rfftfreq(M, FEATURE_EXTRACTION_SAMPLE_RATE)
+    mfcc_filter_bank = get_mel_filter_banks(Vector{Float32}(fftfreq); k=MFCC_SIZE+1)
     #training
     function loss_function(model, ps, st, data)
         input, target, features = data
@@ -147,22 +173,29 @@ function train_final_model(
 
             latent_xs = model.encoder(input_slice, ps.encoder, st.encoder)[1]
             recovered_xs = model.decoder(latent_xs, ps.decoder, st.decoder)[1]
-            encoder_loss += sum(abs2, 1000 * (input_slice[1,:]' - recovered_xs)) + sum(abs2, latent_xs) + sum(abs, latent_xs)
+            encoder_loss += sum(abs2, (input_slice[1,:]' - recovered_xs)) + sum(abs2, latent_xs) + sum(abs, latent_xs)
 
             control, _ = model.control(features_slice, ps.control, st.control)
-            control_loss = sum(abs, control) / length(control) # + sum(abs2, control)
+            control_loss += sum(abs, control) / length(control) # + sum(abs2, control)
         end
 
+        control_loss /= slices
         ps_array = ComponentArray(ps)
         regularization_loss = sum(abs, ps_array) / length(ps_array)
-        raw_loss = sum(abs2, 1000*(generated_sound - target_sound))
-        spectral_loss = 0f0
-        # spectral_loss = sum(abs2, (log10.(abs.(fft(generated_sound .* window) .+ eps(Float32)))
-        #                         .- log10.(abs.(fft(target_sound .* window) .+ eps(Float32)))))
+        raw_loss = sum(abs2, 1000*(generated_sound - target_sound)) / length(generated_sound)
+        #spectral_loss = 0f0
+        #spectral_loss = if M ≥ 133
+        #    generated_spectrogram = mel_periodogram(generated_sound, window, mfcc_filter_bank)
+        #    target_spectrogram = mel_periodogram(target_sound, window, mfcc_filter_bank)
+        #    sum(abs2, generated_spectrogram - target_spectrogram)
+        #else
+        #    0f0
+        #end
 
         # logger("raw_loss=$(raw_loss), spectral_loss=$(spectral_loss), encoder_loss=$(encoder_loss), regularization_loss=$(regularization_loss), control_loss=$(control_loss)")
 
-        return control_loss + regularization_loss + ((encoder_loss + raw_loss) / slices + spectral_loss) / batchsize, st, (nothing,)
+        # return (control_loss / slices) + regularization_loss + ((encoder_loss + raw_loss) / slices + spectral_loss) / batchsize, st, (nothing,)
+        return control_loss + regularization_loss + raw_loss, st, (nothing,)
     end
 
     ps, st = train(

@@ -57,10 +57,10 @@ function (fs::FeatureScanner)((xs, (previous_f0s,))::Tuple{<:AbstractMatrix, Tup
     ys, f0s = [
         begin
             f0 = fs.dio(Vector(x[end-fs.hop_size+1:end]); previous_estimate = f0)
-            spectrogram = log10.(DSP.periodogram(x; fs = fs.dio.sample_rate, window=blackman).power .+ eps(Float32))
-            mc = mfcc(spectrogram; filter_bank = fs.mfcc_filter_bank)
+            spectrogram = DSP.periodogram(x; fs = fs.dio.sample_rate, window=blackman).power .+ floatmin(Float32)
+            mc = mfcc(spectrogram, fs.mfcc_filter_bank)
 
-            [f0.value; f0.confidence; rms(x); mc], f0
+            [f0.value; f0.confidence; log10.(rms(x) + floatmin(eltype(x))); mc], f0
         end
         for (x, f0) ∈ zip(eachcol(xs), previous_f0s)
     ] |> unzip
@@ -108,20 +108,14 @@ struct hNODEVocoder <: Lux.AbstractLuxContainerLayer{(:stream_filter, :feature_s
 
         # models to convert into and from the latent space
         encoder_n = Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_FLOOR)
-        encoder_conv, enсoder_conv_n = conv_1d(encoder_n, Integer(FEATURE_EXTRACTION_SAMPLE_RATE÷F0_CEIL); depth=2)
         encoder = Lux.Chain(
             x -> view(x, 1:encoder_n, :),
-            encoder_conv,
-            Lux.Dense(enсoder_conv_n, enсoder_conv_n, leaky_tanh()),
-            Lux.Dense(enсoder_conv_n, LATENT_DIMS)
+            Dense(encoder_n, encoder_n, leaky_tanh()),
+            Dense(encoder_n, encoder_n, leaky_tanh()),
+            Dense(encoder_n, LATENT_DIMS)
         )
         decoder = Lux.Chain(
-            SkipConnection(
-                Chain(
-                    Dense(LATENT_DIMS, 2*LATENT_DIMS, leaky_tanh()),
-                    Dense(2*LATENT_DIMS, LATENT_DIMS, leaky_tanh())
-                ), +
-            ),
+            Dense(LATENT_DIMS, LATENT_DIMS, leaky_tanh()),
             Dense(LATENT_DIMS, 1)
         )
         # model to get trajectories inside the latent space
@@ -139,7 +133,11 @@ struct hNODEVocoder <: Lux.AbstractLuxContainerLayer{(:stream_filter, :feature_s
         T = n * Δt
 
         control = Lux.Chain(
-            MergeLayer((2, 1, MFCC_SIZE) => 4*params_n, +, leaky_tanh()),
+            Parallel(+;
+                     f0s = Chain(x -> x ./ [F0_CEIL; 1f0], Dense(2, 4*params_n, leaky_tanh())),
+                     loudness = Chain(BatchNorm(1; momentum=0.01f0), Dense(1, 4*params_n, leaky_tanh())),
+                     mfccs = Chain(BatchNorm(MFCC_SIZE; momentum=0.01f0), Dense(MFCC_SIZE, 4*params_n, leaky_tanh()))
+            ),
             Lux.Dense(4*params_n, 4*params_n, leaky_tanh()),
             Lux.Dense(4*params_n, 4*params_n, leaky_tanh()),
             Lux.Dense(4*params_n, params_n)

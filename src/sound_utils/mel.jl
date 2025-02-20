@@ -25,10 +25,16 @@ function get_mel_filter_banks(freqs::Vector{Float32}; k = 30)
     return filters
 end
 
-function mfcc(periodogram::Vector{Float32}; k=30, filter_bank = get_mel_filter_banks(periodogram.freq; k=k))
-    return mfcc([periodogram;;]; k, filter_bank = filter_bank)
+function mel_periodogram(sound, window, mfcc_filter_bank) 
+    windowed_sound = sound .* window
+    mel_spectrum = abs2.(mfcc_filter_bank * rfft(windowed_sound, 1))
+    return log10.(mel_spectrum .+ floatmin(Float32))
 end
 
-function mfcc(periodogram::Matrix{Float32}; k=30, filter_bank = get_mel_filter_banks(periodogram.freq; k=k))
-    return log10.(abs.(dct(filter_bank * periodogram, 1)[2:end]))
+function mfcc(periodogram::Vector{Float32}, filter_bank)
+    return mfcc([periodogram;;], filter_bank)
+end
+
+function mfcc(periodogram::Matrix{Float32}, filter_bank)
+    return dct(log10.(filter_bank * periodogram), 1)[2:end]
 end
